@@ -250,7 +250,7 @@ static const Opt Opts[] = {
     { "HookOnlyGameModules", "true", "true = skip callers inside the Windows folder (game/mod DLLs only)" },
     { "HookLegacyNtdll", "false", "Also allow the legacy ntdll stub patching when HookModules is empty. Dangerous: races other mods' ntdll hooks" },
     { "HookModules", "", "Comma-separated module names whose IAT is instrumented, e.g. artifact.dll. Empty = no per-module IAT hooks, but the KERNELBASE interposition layer is still installed and logs ALL callers" },
-    { "HookExe", "true", "Also instrument the game executable's own import table (its file/registry/memory/exception-handler imports) - this is where the protection's first-hop imports usually live" },
+    { "HookExe", "false", "Also instrument the game executable's own import table. OFF by default: a Denuvo-protected exe checks its own imports, and repointing them can make it fail its own tamper check (seen as 'corrupt pak index' in UE titles). Turn on only when you need the exe's own first-hop calls" },
     { "MaxHookReports", "2000", "Cap on hook log lines so a chatty caller cannot flood the console" },
     { "#", "", "Read-only survey: what OTHER code has already inline-hooked ntdll" },
     { "ScanOtherHooks", "true", "Read-only ntdll survey: report EVERY export whose entry is a jump instead of a clean syscall stub, classified - hooked by other module / same-image alias / NON-EXPORT same-image target (cave). Runs at startup and re-runs each heartbeat (new sites only). Never writes anything" },
@@ -664,21 +664,17 @@ static void CrashFileAppend(const WCHAR* msg)
 }
 
 // ---------------------------------------------------------------- describe
+static int CallerRangeFor(ULONG_PTR addr, ULONG_PTR* base, ULONG_PTR* end, const WCHAR** name, int* sys);
+
+// Lock-free (caller-range table); may run inside hooks.
 static void Describe(void* addr, WCHAR* out, int cch)
 {
-    HMODULE mod;
-    if (GetModuleHandleExW(0x4 | 0x2, (LPCWSTR)addr, &mod))
-    {
-        WCHAR path[520]; DWORD len, j; const WCHAR* name;
-        len = GetModuleFileNameW(mod, path, 520);
-        name = path;
-        for (j = 0; j < len; j++) if (path[j] == L'\\' || path[j] == L'/') name = path + j + 1;
-        StringCchPrintfW(out, cch, L"%s+0x%llX", name, (unsigned long long)((BYTE*)addr - (BYTE*)mod));
-    }
+    ULONG_PTR base = 0;
+    const WCHAR* name = NULL;
+    if (CallerRangeFor((ULONG_PTR)addr, &base, NULL, &name, NULL) && name && name[0])
+        StringCchPrintfW(out, cch, L"%s+0x%llX", name, (unsigned long long)((ULONG_PTR)addr - base));
     else
-    {
         StringCchPrintfW(out, cch, L"0x%llX (no module)", (unsigned long long)(ULONG_PTR)addr);
-    }
 }
 
 static int IsPlumbingName(const WCHAR* name)
@@ -980,28 +976,130 @@ static int IsSkipName(const WCHAR* n)
     return 0;
 }
 
-static void NoteHiddenCallerModule(HMODULE m, const WCHAR* name);   // defined after the module-range table
-static void NoteHookCandidate(HMODULE m, const WCHAR* name);        // defined with the hook retry state
+// ---------------------------------------------------------------- caller ranges
+// Caller attribution must be LOCK-FREE. This runs inside hooks, and
+// GetModuleHandleExW / GetModuleFileNameW take the loader lock: a loader thread
+// that holds that lock and waits on a thread sitting in one of our hooks
+// deadlocks, and the game hangs (seen as a hang at startup once the exe's own
+// IAT and the KERNELBASE layer were instrumented). So the worker keeps a plain
+// table of module ranges (base/end/name) and the hook path only reads it.
+// A caller outside the table (a hidden module such as dse.dll, which is in no
+// loader list) is queued BY ADDRESS; the worker resolves it with the loader
+// APIs - safe there - reports it, adds it to the table so every later call is
+// named too, and instruments it if it is a pending HookModules target.
+typedef struct { ULONG_PTR base, end; WCHAR name[64]; int sys, manual; } CallerRange;
+#define MAX_CRANGE 768
+static CallerRange g_crange[MAX_CRANGE];
+static volatile LONG g_nCrange = 0;
 
+static int CallerRangeFor(ULONG_PTR addr, ULONG_PTR* base, ULONG_PTR* end, const WCHAR** name, int* sys)
+{
+    int i, n = (int)g_nCrange;
+    if (n > MAX_CRANGE) n = MAX_CRANGE;
+    for (i = 0; i < n; i++)
+    {
+        ULONG_PTR b = g_crange[i].base;
+        if (addr >= b && addr < g_crange[i].end)
+        {
+            if (base) *base = b;
+            if (end) *end = g_crange[i].end;
+            if (name) *name = g_crange[i].name;
+            if (sys) *sys = g_crange[i].sys;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// worker thread only
+static void CallerAddRange(ULONG_PTR base, ULONG_PTR size, const WCHAR* name, int sys, int manual)
+{
+    int n = (int)g_nCrange, i;
+    if (!base) return;
+    for (i = 0; i < n; i++) if (g_crange[i].base == base) return;
+    if (n >= MAX_CRANGE) return;
+    g_crange[n].base = base;
+    g_crange[n].end = base + (size ? size : 0x1000);
+    StringCchCopyW(g_crange[n].name, 64, (name && name[0]) ? name : L"(unknown)");
+    g_crange[n].sys = sys;
+    g_crange[n].manual = manual;
+    InterlockedIncrement(&g_nCrange);          // publish
+}
+
+// worker thread only: rebuild from toolhelp (which does list the Denuvo shadow
+// copies, under their real system names) while keeping resolved hidden modules
+static void RefreshCallerRanges(void)
+{
+    CallerRange keep[64];
+    int nk = 0, n = 0, i;
+    HANDLE snap;
+    MODULEENTRY32W me;
+    if (!g_win[0]) GetWindowsDirectoryW(g_win, 300);
+    if (!g_pid) g_pid = GetCurrentProcessId();
+    for (i = 0; i < (int)g_nCrange && nk < 64; i++)
+        if (g_crange[i].manual) keep[nk++] = g_crange[i];
+    snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, g_pid);
+    if (snap != INVALID_HANDLE_VALUE)
+    {
+        me.dwSize = sizeof(me);
+        if (Module32FirstW(snap, &me))
+        {
+            do
+            {
+                if (n < MAX_CRANGE)
+                {
+                    g_crange[n].base = (ULONG_PTR)me.hModule;
+                    g_crange[n].end = (ULONG_PTR)me.hModule + me.modBaseSize;
+                    StringCchCopyW(g_crange[n].name, 64, me.szModule);
+                    g_crange[n].sys = (g_win[0] && _wcsnicmp(me.szExePath, g_win, wcslen(g_win)) == 0);
+                    g_crange[n].manual = 0;
+                    n++;
+                }
+            } while (Module32NextW(snap, &me));
+        }
+        CloseHandle(snap);
+    }
+    for (i = 0; i < nk && n < MAX_CRANGE; i++)
+    {
+        int j, dup = 0;
+        for (j = 0; j < n; j++) if (g_crange[j].base == keep[i].base) { dup = 1; break; }
+        if (!dup) g_crange[n++] = keep[i];
+    }
+    if (n) InterlockedExchange(&g_nCrange, n);
+}
+
+// Hook path: remember an unresolved caller address. No locks, no loader calls.
+#define MAX_CADDR 16
+static ULONG_PTR g_caddr[MAX_CADDR];
+static volatile LONG g_nCaddr = 0;
+
+static void NoteCallerAddr(ULONG_PTR addr)
+{
+    LONG n = g_nCaddr;
+    int i;
+    if (!addr || n >= MAX_CADDR) return;
+    for (i = 0; i < n; i++) if (g_caddr[i] == addr) return;
+    g_caddr[n] = addr;
+    InterlockedIncrement(&g_nCaddr);
+}
+
+// Lock-free: no loader-lock calls here (see the caller-range table above).
 static int DescribeCaller(WCHAR* out, int cch)
 {
-    void* frames[10];
+    void* frames[12];
     USHORT n, i;
     if (!pStack) return 0;
-    n = pStack(0, 10, frames, NULL);
+    n = pStack(0, 12, frames, NULL);
     for (i = 1; i < n; i++)
     {
-        HMODULE m;
-        WCHAR path[520];
-        DWORD len, j;
-        const WCHAR* name = path;
-        if (!GetModuleHandleExW(0x4 | 0x2, (LPCWSTR)frames[i], &m)) continue;
-        len = GetModuleFileNameW(m, path, 520);
-        for (j = 0; j < len; j++) if (path[j] == L'\\' || path[j] == L'/') name = path + j + 1;
-        NoteHiddenCallerModule(m, name);
-        NoteHookCandidate(m, name);
+        ULONG_PTR base = 0;
+        const WCHAR* name = NULL;
+        int sys = 0;
+        NoteCallerAddr((ULONG_PTR)frames[i]);          // queued for the worker
+        if (!CallerRangeFor((ULONG_PTR)frames[i], &base, NULL, &name, &sys)) continue;
+        if (!name || !name[0]) continue;
         if (IsSkipName(name)) continue;
-        if (g_onlyGame && g_win[0] && _wcsnicmp(path, g_win, wcslen(g_win)) == 0) continue;
+        if (g_onlyGame && sys) continue;
         if (g_filter[0])
         {
             int ok = 0; const WCHAR* p = g_filter;
@@ -1017,7 +1115,8 @@ static int DescribeCaller(WCHAR* out, int cch)
             }
             if (!ok) continue;
         }
-        StringCchPrintfW(out, cch, L"%s+0x%llX", name, (unsigned long long)((BYTE*)frames[i] - (BYTE*)m));
+        StringCchPrintfW(out, cch, L"%s+0x%llX", name,
+                         (unsigned long long)((ULONG_PTR)frames[i] - base));
         return 1;
     }
     return 0;
@@ -1441,7 +1540,9 @@ static void* ThunkTargetIsCode(void* f)
     ULONG_PTR rva;
     int i;
     if (!f) return NULL;
-    if (!GetModuleHandleExW(0x2 /*UNCHANGED_REFCOUNT*/ | 0x4 /*FROM_ADDRESS*/, (LPCWSTR)f, &img) || !img)
+    // caller-range table, not GetModuleHandleExW: this runs inside the
+    // GetProcAddress hook, so it must not take the loader lock
+    if (!CallerRangeFor((ULONG_PTR)f, (ULONG_PTR*)&img, NULL, NULL, NULL) || !img)
         return NULL;                                  // not in any image
     __try
     {
@@ -2795,57 +2896,6 @@ typedef struct { ULONG_PTR base; DWORD size; WCHAR name[64]; int idx; } ModRange
 static ModRange g_modRange[320];
 static int g_nModRange = 0;
 
-// A module that GetModuleHandle resolves but toolhelp32 does not list is a
-// hidden loader entry (hash-table-only insert, or a relinked loader list). The
-// game's own DLLs and the Windows loader never do this; the protection does.
-//
-// The check is DEFERRED: hooks run on game threads, where taking a toolhelp
-// snapshot could deadlock against the loader lock, so the hook path only queues
-// the candidate. The worker thread verifies against a fresh table and reports.
-typedef struct { ULONG_PTR base; WCHAR name[64]; } HiddenCand;
-static HiddenCand g_hiddenCand[16]; static int g_nHiddenCand = 0;
-static ULONG_PTR g_hiddenReported[32]; static int g_nHiddenReported = 0;
-static void RefreshModuleRanges(void);
-
-static void NoteHiddenCallerModule(HMODULE m, const WCHAR* name)
-{
-    ULONG_PTR b = (ULONG_PTR)m;
-    int i;
-    if (!ScanLdr || !m) return;
-    for (i = 0; i < g_nHiddenReported; i++) if (g_hiddenReported[i] == b) return;
-    for (i = 0; i < g_nHiddenCand; i++) if (g_hiddenCand[i].base == b) return;
-    if (g_nHiddenCand >= 16) return;
-    g_hiddenCand[g_nHiddenCand].base = b;
-    StringCchCopyW(g_hiddenCand[g_nHiddenCand].name, 64, name[0] ? name : L"(unnamed)");
-    g_nHiddenCand++;
-}
-
-static void HiddenModulesVerify(void)
-{
-    int i, j;
-    if (!ScanLdr || !g_nHiddenCand) return;
-    RefreshModuleRanges();                    // safe here: worker thread
-    for (i = 0; i < g_nHiddenCand; i++)
-    {
-        ULONG_PTR b = g_hiddenCand[i].base;
-        int known = 0;
-        MEMORY_BASIC_INFORMATION mb;
-        for (j = 0; j < g_nModRange; j++) if (g_modRange[j].base == b) { known = 1; break; }
-        if (known) { g_hiddenCand[i] = g_hiddenCand[--g_nHiddenCand]; i--; continue; }
-        if (g_nHiddenReported < 32) g_hiddenReported[g_nHiddenReported++] = b;
-        if (VirtualQuery((void*)b, &mb, sizeof(mb)))
-        {
-            WCHAR line[600];
-            StringCchPrintfW(line, 600, L"hidden module: %s @0x%llX size 0x%llX type 0x%X protect 0x%X - resolvable by GetModuleHandle, absent from toolhelp32 (verified)",
-                             g_hiddenCand[i].name, (unsigned long long)b,
-                             (unsigned long long)mb.RegionSize, (unsigned)mb.Type, (unsigned)mb.Protect);
-            Write(L"[SCAN]", line);
-            CsvRow(L"ldr-hidden", g_hiddenCand[i].name, line, L"");
-        }
-        g_hiddenCand[i] = g_hiddenCand[--g_nHiddenCand]; i--;
-    }
-}
-
 static void RefreshModuleRanges(void)
 {
     HANDLE snap; MODULEENTRY32W me; int i, j;
@@ -3166,28 +3216,6 @@ static void InstallKernelbaseInterposition(void);
 static int IsPendingHook(const WCHAR* name);
 static void HookLateModules(void);
 
-// Modules that caller attribution resolved to a base (queued from the hook
-// path, drained on the worker thread) - used to hook a hidden module by
-// address when its name cannot be resolved.
-typedef struct { ULONG_PTR base; WCHAR name[64]; } HookCand;
-static HookCand g_hookCand[16];
-static volatile LONG g_nHookCand = 0;
-
-// Called from the hook path (arbitrary game thread): if the module that made
-// this call is one we are still waiting to instrument, remember its base so
-// the worker can hook it by address. No snapshot, no allocation, no I/O.
-static void NoteHookCandidate(HMODULE m, const WCHAR* name)
-{
-    LONG n;
-    if (!m || !name || !name[0] || !g_nPendHook) return;
-    if (!IsPendingHook(name)) return;
-    n = g_nHookCand;
-    if (n >= 16) return;
-    g_hookCand[n].base = (ULONG_PTR)m;
-    StringCchCopyW(g_hookCand[n].name, 64, name);
-    InterlockedIncrement(&g_nHookCand);
-}
-
 static void HookAddPending(const WCHAR* name)
 {
     int i;
@@ -3376,10 +3404,8 @@ static int HookOneModule(HMODULE mod, const WCHAR* modName)
     }
 }
 
-// Try again for hook targets that were not loaded at startup, and hook a
-// module that caller attribution already located by address (a hidden module
-// such as dse.dll is not resolvable by name, but the stack walk gives its
-// base).
+// Try again for hook targets that were not loaded at startup. Runs on the
+// worker, where the loader APIs are safe.
 static void HookLateModules(void)
 {
     int i;
@@ -3399,23 +3425,67 @@ static void HookLateModules(void)
             i--;
         }
     }
-    {
-    int nc = (int)InterlockedExchange(&g_nHookCand, 0);
-    if (nc > 16) nc = 16;
+}
+
+// Worker side of the deferred caller attribution (the hook path only queues
+// bare addresses): resolve each address, report a module that toolhelp32 does
+// not list as hidden, add it to the caller-range table so later calls are named
+// immediately, and instrument it if it is a pending HookModules target.
+static ULONG_PTR g_hiddenReported2[32]; static int g_nHiddenReported2 = 0;
+
+static void ResolveCallerAddrs(void)
+{
+    LONG nc = InterlockedExchange(&g_nCaddr, 0);
+    int i;
+    if (nc > MAX_CADDR) nc = MAX_CADDR;
+    // refresh FIRST: "hidden" must mean absent from toolhelp right now, not
+    // merely absent from a table that predates a module loading (an ordinary
+    // DLL loaded on demand would otherwise be mislabelled hidden)
+    if (nc) RefreshCallerRanges();
     for (i = 0; i < nc; i++)
     {
-        if (g_hookCand[i].base && IsPendingHook(g_hookCand[i].name))
+        ULONG_PTR a = g_caddr[i];
+        HMODULE m = NULL;
+        WCHAR path[520], name[64];
+        const WCHAR* b;
+        DWORD len, j;
+        if (!a) continue;
+        if (!GetModuleHandleExW(0x4 | 0x2, (LPCWSTR)a, &m) || !m) continue;
+        if (CallerRangeFor((ULONG_PTR)m, NULL, NULL, NULL, NULL)) continue;   // already known
+        len = GetModuleFileNameW(m, path, 520);
+        b = path;
+        for (j = 0; j < len; j++) if (path[j] == L'\\' || path[j] == L'/') b = path + j + 1;
+        StringCchCopyW(name, 64, (b && b[0]) ? b : L"(unnamed)");
         {
-            WCHAR name[130], msg[400];
-            int n;
-            StringCchCopyW(name, 130, g_hookCand[i].name);
-            n = HookOneModule((HMODULE)g_hookCand[i].base, name);
+            MEMORY_BASIC_INFORMATION mb;
+            ULONG_PTR size = 0;
+            int k, dup = 0;
+            memset(&mb, 0, sizeof(mb));
+            if (VirtualQuery((void*)m, &mb, sizeof(mb)) && (ULONG_PTR)mb.BaseAddress == (ULONG_PTR)m)
+                size = mb.RegionSize;
+            for (k = 0; k < g_nHiddenReported2; k++) if (g_hiddenReported2[k] == (ULONG_PTR)m) { dup = 1; break; }
+            if (!dup && ScanLdr)
+            {
+                WCHAR line[700];
+                if (g_nHiddenReported2 < 32) g_hiddenReported2[g_nHiddenReported2++] = (ULONG_PTR)m;
+                StringCchPrintfW(line, 700,
+                    L"hidden module: %s @0x%llX size 0x%llX type 0x%X protect 0x%X - resolvable by GetModuleHandle, absent from toolhelp32 (verified)",
+                    name, (unsigned long long)(ULONG_PTR)m, (unsigned long long)size,
+                    (unsigned)mb.Type, (unsigned)mb.Protect);
+                Write(L"[SCAN]", line);
+                CsvRow(L"ldr-hidden", name, line, L"");
+            }
+            CallerAddRange((ULONG_PTR)m, size, name, 0, 1);
+        }
+        if (IsPendingHook(name))
+        {
+            WCHAR msg[400];
+            int n = HookOneModule(m, name);
             StringCchPrintfW(msg, 400, L"(iat) %s located by address (hidden module, absent from toolhelp32) - instrumented now (%d imports)", name, n);
             HookNote(msg);
             CsvRow(L"hook-late", name, msg, L"");
             HookClearPending(name);
         }
-    }
     }
 }
 
@@ -4470,7 +4540,14 @@ static void RunMonitors(long long n)
     }
     if (MemGuardScan && n % 20 == 0) SafeCall(ScanGuardPages);
     if (WatchSharedData && n % 12 == 0) SafeCall(WatchSharedDataTick);
-    if (n % 4 == 1) HookLateModules();      // ~1 s: pick up mod DLLs that load after us
+    if (n % 4 == 1)
+    {
+        // ~1 s: pick up mod DLLs that load after us, and resolve any caller the
+        // hook path could not name (a hidden module like dse.dll)
+        HookLateModules();
+        ResolveCallerAddrs();
+    }
+    if (n % 40 == 7) RefreshCallerRanges();  // keep caller naming current
 }
 
 // ---------------------------------------------------------------- log tailing
@@ -4779,20 +4856,17 @@ static void InstallHooks(void)
 // anywhere: only reads of already-mapped executable memory, safe from any
 // thread, cannot race another patcher. Runs at startup and is re-run on each
 // heartbeat; rescans report only sites not seen before.
+// Lock-free by design: this is called from the VEH/IAT hooks as well as from
+// the worker, so it may not touch the loader lock. Hidden modules are added to
+// the caller-range table by the worker once they are resolved by address.
 static void DescribeModuleOf(void* addr, WCHAR* out, int cch)
 {
-    HMODULE m = NULL;
+    ULONG_PTR base = 0;
+    const WCHAR* name = NULL;
     out[0] = 0;
-    if (GetModuleHandleExW(0x4 | 0x2, (LPCWSTR)addr, &m) && m)
-    {
-        WCHAR path[520];
-        DWORD len = GetModuleFileNameW(m, path, 520);
-        const WCHAR* name = path;
-        DWORD j;
-        for (j = 0; j < len; j++) if (path[j] == L'\\' || path[j] == L'/') name = path + j + 1;
+    if (CallerRangeFor((ULONG_PTR)addr, &base, NULL, &name, NULL) && name && name[0])
         StringCchPrintfW(out, (size_t)cch, L"%s+0x%llX", name,
-                         (unsigned long long)((BYTE*)addr - (BYTE*)m));
-    }
+                         (unsigned long long)((ULONG_PTR)addr - base));
     else
         StringCchPrintfW(out, (size_t)cch, L"0x%llX", (unsigned long long)(ULONG_PTR)addr);
 }
@@ -5084,7 +5158,7 @@ static int ScanNtdllHooks(int first, int reportMax)
     return g_scanTotal;
 }
 
-static void ScanRescan(void) { ScanNtdllHooks(0, ScanOtherHooksMax); ShadowSurvey(0); LdrSurvey(0); HiddenModulesVerify(); }
+static void ScanRescan(void) { ScanNtdllHooks(0, ScanOtherHooksMax); ShadowSurvey(0); LdrSurvey(0); }
 
 // ---------------------------------------------------------------- PEB loader list
 // Toolhelp32 walks the loader list with its own validation. A manually-mapped
@@ -6301,6 +6375,10 @@ static DWORD WINAPI WorkerThread(LPVOID param)
         Write(L"[INFO]", msg);
     }
     { WCHAR msg[900]; StringCchPrintfW(msg, 900, L"settings file: %s", g_iniPath); Write(L"[INFO]", msg); }
+    // Build the lock-free caller table BEFORE any hook is installed: the hook
+    // path names callers from this table and must never call the loader APIs.
+    RefreshCallerRanges();
+    Trace(L"caller ranges ready");
     InstallVehCapture();
     Trace(L"veh/crash capture installed");
     InstallModuleLog();

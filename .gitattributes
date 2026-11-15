@@ -1,0 +1,25 @@
+# Normalise line endings: LF in the repository for everything text, so the
+# CRLF/LF churn stops on Windows (the tool builds fine with LF sources).
+* text=auto eol=lf
+
+# Source and docs: LF in the working tree too.
+*.c    text eol=lf
+*.h    text eol=lf
+*.md   text eol=lf
+*.ini  text eol=lf
+*.ps1  text eol=lf
+*.txt  text eol=lf
+.gitignore  text eol=lf
+
+# Batch files: keep CRLF in the working tree, which cmd.exe is happiest with.
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+
+# Build outputs are never tracked (see .gitignore), but if one slips in, treat
+# it as opaque so git never rewrites bytes inside a binary.
+*.dll  binary
+*.exe  binary
+*.obj  binary
+*.lib  binary
+*.pdb  binary
+*.sys  binary

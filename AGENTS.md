@@ -35,13 +35,24 @@ game-specific code, so the same build can be pointed at another title.
    file inside `Write()`; the console is scraped only to relay the game's own
    output as `[raw]`. Never route tagged lines through the console buffer.
 5. **No work under the loader lock.** `DllMain` spawns the worker and returns.
-6. **Never call toolhelp/loader APIs from a hooked game thread** — the snapshot
-   can deadlock against the loader lock. Queue from the hook path and verify on
-   the worker: `NoteHiddenCallerModule` → `HiddenModulesVerify`,
-   `NoteHookCandidate` → `HookLateModules`.
-7. **Keep the game stable.** A crash is a failed run. The apphelp
+6. **The hook path must be lock-free. No loader APIs, no toolhelp, no
+   `GetModuleHandleExW`/`GetModuleFileNameW`, no file I/O, no allocation.**
+   Anything the hook path needs is either a plain read of a worker-maintained
+   table (`g_crange` via `CallerRangeFor`) or queued for the worker
+   (`NoteCallerAddr` → `ResolveCallerAddrs`, `HookAddPending` →
+   `HookLateModules`). This is not a style rule: a loader thread holding the
+   loader lock and waiting on a thread sitting in one of our hooks deadlocks,
+   and the game **hangs** — which is exactly what happened when caller
+   attribution was still calling `GetModuleHandleExW`.
+7. **Keep the game stable.** A crash or a hang is a failed run. The apphelp
    `SE_DllLoaded+0x3ae` `0xC0000409` fast-fail at process exit is cosmetic and
-   accepted.
+   accepted; nothing else is.
+8. **Do not instrument a protected exe's own imports by default.** Denuvo checks
+   the EXE's import table; repointing it makes the protection fail its own
+   tamper check, which surfaces as `Corrupt pak index detected` in Unreal
+   titles. That is why `HookExe` defaults to **false** — the KERNELBASE
+   interposition layer already covers calls that go through KERNELBASE, without
+   touching the protected image.
 
 ## Build, deploy, validate
 
@@ -168,7 +179,12 @@ mutual probing), `veh add|remove`, `veh add continue`, `ueh set`, `regkey`
 ## Gotchas already paid for
 
 * Empty `HookModules` means **KERNELBASE interposition for all callers**, not
-  "no hooks"; `HookExe` additionally instruments the game exe's own IAT.
+  "no hooks"; `HookExe` (off by default) additionally instruments the game exe's
+  own IAT — and that is what triggers a Denuvo tamper check.
+* Caller naming comes from `g_crange`, refreshed by the worker. A caller that
+  is not in it is queued by address; the worker refreshes the table **before**
+  deciding, otherwise an ordinary DLL that loaded on demand gets mislabelled
+  "hidden module" (that happened with `NSI.dll`).
 * A mod's helper DLL loads *after* this DLL: unresolved hook targets are logged,
   retried each heartbeat, and a hidden module is hooked **by address** from
   caller attribution.

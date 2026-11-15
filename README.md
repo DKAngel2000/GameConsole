@@ -134,11 +134,13 @@ Two modes, selected by `HookModules`:
   `(iat) dse.dll located by address (hidden module, absent from toolhelp32) -
   instrumented now (N imports)`.
 
-- **`HookExe`** (default on) adds the game executable's own basename to the
+- **`HookExe`** (default **off**) adds the game executable's own basename to the
   instrumented list, so its file/registry/memory/exception-handler imports are
-  covered. With `HookModules` empty this is the only import table instrumented;
-  the KERNELBASE layer still covers every caller. Set it to `false` to instrument
-  only the modules you name.
+  covered. Leave it off for a Denuvo-protected exe: the protection checks its own
+  import table, and repointing it makes it fail its own tamper check — which
+  shows up as `Corrupt pak index detected` in Unreal titles (both PB0 and FFRS
+  did this). The KERNELBASE interposition layer already covers calls that go
+  through KERNELBASE without touching the protected image.
 
 - **`HookModules` empty** — no per-module IAT hooks, but the **KERNELBASE
   interposition layer is still installed**, so calls from *any* module through
@@ -386,6 +388,25 @@ an emu do *to each other*:
   before it). Use Sysinternals Process Monitor for that first window.
 - File names for read/write come from `NtQueryInformationFile` and can be relative
   (no drive prefix).
+
+### If a game crashes or hangs
+
+Two failure modes were found the hard way and are now designed out — check these
+first if a title misbehaves:
+
+- **`Corrupt pak index detected` (Unreal) / the protection failing a tamper
+  check.** The EXE's own import table was being repointed (`HookExe=true`). Set
+  `HookExe=false` (the new default). The KERNELBASE interposition layer keeps
+  working and does not touch the protected image.
+- **The game hangs at startup, especially while loading DLLs.** Caller
+  attribution must never take the loader lock: the hook path names callers from
+  a plain table the worker keeps up to date, and anything it cannot name is
+  queued by address for the worker to resolve. If you add a call to a hooked
+  path, it may not use `GetModuleHandle*`, `GetModuleFileName*`, toolhelp or any
+  allocation.
+
+Bisect order if something still goes wrong: `HookExe=false` → `GpaThunks=false`
+→ `HookApis=false` (surveys keep running, only the hook layer is off).
 
 ## Exceptions, OutputDebugString, crashes, module log
 
