@@ -1,0 +1,17 @@
+# build outputs
+*.obj
+*.exp
+*.lib
+*.exe
+*.dll
+*.pdb
+*.ilk
+bin/
+obj/
+
+# runtime output (logs land next to the game, but keep stray ones out)
+logs/
+*.log
+*.csv
+GameConsole_crash.log
+progress.txt
