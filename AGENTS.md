@@ -129,7 +129,8 @@ ntdll#1!NtOpenFile -> ScanTest.exe+0x1000  (hooked: FF25 abs jmp)
 Hook kinds seen on `[HOOK]` lines: `create/open/read/write/...` (file+memory),
 `qip/sit/sip/qit/setctx/getctx/cthex/avm/rvm/wvm/qvmm/openthr` (anti-debug and
 mutual probing), `veh add|remove`, `veh add continue`, `ueh set`, `regkey`
-(CREATED only), `regset`, `svc openmgr|create|start|delete`, `gpa`, `iat`.
+(CREATED only), `regset`, `syst` (`NtSetSystemInformation`), `svc
+openmgr|create|start|delete`, `gpa`, `iat`.
 
 ## Domain knowledge from real runs (observational)
 
@@ -151,20 +152,39 @@ mutual probing), `veh add|remove`, `veh add continue`, `ueh set`, `regkey`
 * **`dse.dll`** is a hidden helper: in no toolhelp list and no PEB loader list,
   but resolvable by address; it does cross-process `NtWriteVirtualMemory`
   (2 writes per target into ~20 processes) and writes registry/service keys.
-* **Hypervisor drivers**: `hyperkd.sys` (ships in `<game>\Artifact_Intel\`),
-  `legion.sys` (FFRS and Crimson Desert), `simplesvm.sys` (not present on the
-  dev machine), plus Microsoft's `hvservice.sys`. `NtLoadDriver`/`ZwLoadDriver`
-  are imported by none of them, so the load goes through `CreateServiceW` +
-  `StartServiceW` and the registry (`ImagePath`/`Type`/`Start`).
-* **Anti-debug**: PB0 runs a self-probe single-step loop (183–189 events/run,
-  byte-identical: `rip=Dr3=0x15C6DBAA0`, `Dr6=FFFF0FF0`, `Dr7=0x440`), and
-  probes `ProcessDebugPort` (class 0xC), `ThreadHideFromDebugger` (0x11) etc.
-  FFRS shows none of that; the KUSER_SHARED_DATA mailbox stays `…37133713`.
+* **Hypervisor drivers**: `hyperkd.sys` (ships in `<game>\Artifact_Intel\`;
+  PZ2 registers it under a service key called `artifact`, so match a service's
+  *ImagePath basename*, never the key name, when asking "is it loaded"),
+  `simplesvm.sys` (not seen on the dev machine), plus Microsoft's
+  `hvservice.sys`. `NtLoadDriver`/`ZwLoadDriver` are imported by none of them, so
+  the load goes through `CreateServiceW` + `StartServiceW` and the registry
+  (`ImagePath`/`Type`/`Start`).
+* **The hypervisor can be loaded without advertising itself**: on PZ2
+  `hyperkd.sys` was loaded (load-order 252, service `artifact` RUNNING) while
+  `CPUID.1:ECX[31]` was 0. So CPUID alone is not evidence — `[SYS]` is
+  cross-referenced against the loaded `ServiceWatch` kernel modules for exactly
+  this reason, and is re-probed each heartbeat so arming/unloading is caught.
+* **artifact's VEH handler never appears in the OS chain**: with `ScanEh` the
+  process VEH list contained only GameConsole's own handler, because the
+  protection proxies `ntdll#1!RtlAddVectoredExceptionHandler` and keeps a
+  private handler list. Registrations are only visible through the IAT hooks
+  when the module doing them is instrumented (`HookModules`).
+* **Anti-debug**: both PB0 and PZ2 run a self-probe single-step loop
+  (byte-identical: `Dr6=FFFF0FF0`, `Dr7=0x440`, `rip=Dr3`), and probe
+  `ProcessDebugPort` (class 0xC), `AmILastThread` (12), `ThreadHideFromDebugger`
+  (0x11) etc. FFRS shows none of that; its KUSER_SHARED_DATA mailbox stays
+  `…37133713`.
 * **Crashes/exceptions** that are *not* the protection: FFRS's
   `steam_api64.dll+0x9C381B` throws `0xE06D7363` ~100–200× per run.
 
 ## Windows quirks this code accounts for
 
+* There is no reliable *documented* user-mode hypervisor query on this build:
+  `tools/SysInfoProbe.c` swept `NtQuerySystemInformation` classes 0x00–0x120 and
+  none returned an unambiguous hypervisor structure (the classes that succeed
+  are all zeros when no hypervisor is armed). Hypervisor presence is therefore
+  reported from CPUID **plus** the loaded kernel-module list, not from an
+  undocumented query — do not "fix" that by guessing a class number.
 * Kernel base addresses are **redacted** for ordinary callers via
   `SystemModuleInformation` — `[KRNL]` reports names/sizes/load order and says so.
 * The object manager's `\Driver` directory returns `STATUS_ACCESS_DENIED`

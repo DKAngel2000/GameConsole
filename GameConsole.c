@@ -139,7 +139,7 @@ static int ScanServices = 1;         // SCM service scan
 static int ScanDrivers = 1;          // loaded kernel modules
 static int ServiceWatchAll = 0;      // list everything, not just the watch list
 static int HookExe = 1;              // also instrument the game exe's IAT
-static WCHAR ServiceWatch[400] = L"denuvo,hypervisor,hvservice,hyperkd,simplesvm,legion,vgk,vgc,vanguard,easyanticheat,battleye,beservice,bedaisy,nprotect,gameguard,xigncode,arxan,vmprotect,themis,xtrap";
+static WCHAR ServiceWatch[400] = L"denuvo,hypervisor,hvservice,hyperkd,simplesvm,vgk,vgc,vanguard,easyanticheat,battleye,beservice,bedaisy,nprotect,gameguard,xigncode,arxan,vmprotect,themis,xtrap";
 #define MAX_SHADOWSEEN 64
 static ULONG_PTR g_shadowSeen[MAX_SHADOWSEEN]; static int g_nShadowSeen = 0;
 static int CensusAll = 1, CensusAllMax = 300;
@@ -264,7 +264,7 @@ static const Opt Opts[] = {
     { "ScanEh", "true", "Report the process's real vectored-exception-handler chain (who registered which handler, in what order) - read-only walk from GameConsole's own registration - and log every later VEH/UEH registration via IAT hooks" },
     { "ScanServices", "true", "Enumerate Windows services read-only and report the ones matching ServiceWatch (name/display/path), plus new ones that appear while the game runs" },
     { "ScanDrivers", "true", "Enumerate loaded kernel drivers read-only (NtQuerySystemInformation) and report the ones matching ServiceWatch - the kernel/hypervisor component a protection service installs" },
-    { "ServiceWatch", "denuvo,hypervisor,hvservice,hyperkd,simplesvm,legion,vgk,vgc,vanguard,easyanticheat,battleye,beservice,bedaisy,nprotect,gameguard,xigncode,arxan,vmprotect,themis,xtrap", "Comma-separated words matched case-insensitively against service names, display names, binary paths, kernel driver paths and the CPUID hypervisor vendor" },
+    { "ServiceWatch", "denuvo,hypervisor,hvservice,hyperkd,simplesvm,vgk,vgc,vanguard,easyanticheat,battleye,beservice,bedaisy,nprotect,gameguard,xigncode,arxan,vmprotect,themis,xtrap", "Comma-separated words matched case-insensitively against service names, display names, binary paths, kernel driver paths and the CPUID hypervisor vendor" },
     { "ServiceWatchAll", "false", "Also list EVERY running service / loaded kernel driver, not just the ones matching ServiceWatch (noisy)" },
     { "WatchSharedData", "true", "Watch the last bytes of KUSER_SHARED_DATA (0x7FFE0FE0..0x1000) for changes - artifact arms Dr3 there, so it may be a handshake mailbox" },
     { "MemGuardScan", "true", "Report committed non-image pages carrying PAGE_GUARD or PAGE_NOACCESS (anti-debug tripwires)" },
@@ -1900,6 +1900,33 @@ static LONG WINAPI HkIatKbNtSetValueKey(HANDLE key, GC_UNI* vname, ULONG idx,
     return st;
 }
 
+// NtSetSystemInformation: rare, and exactly the kind of call a protection uses
+// for system-wide tweaks (kernel debugger / code integrity / driver loading
+// style classes). Logged with class, length and the first dword of the payload.
+typedef LONG (WINAPI* t_NtSetSystemInformation)(ULONG, void*, ULONG);
+static t_NtSetSystemInformation pIatNtSsi_ = NULL;
+
+static LONG WINAPI HkIatKbNtSsi(ULONG cls, void* info, ULONG len)
+{
+    LONG st = pIatNtSsi_(cls, info, len);
+    if (!inHook && g_hooksActive && g_count < g_cap)
+    {
+        WCHAR caller[300], msg[800];
+        unsigned long long v1 = 0;
+        __try { if (info && len >= 4) v1 = *(ULONG*)info; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { v1 = 0; }
+        inHook = 1;
+        if (DescribeCaller(caller, 300))
+        {
+            StringCchPrintfW(msg, 800, L"syst   st=0x%08X class=0x%lX len=%lu first=0x%llX  <- %s",
+                             (unsigned)st, (unsigned long)cls, (unsigned long)len, v1, caller);
+            EmitHook(msg);
+        }
+        inHook = 0;
+    }
+    return st;
+}
+
 static LONG WINAPI HkIatKbNtQip(HANDLE proc, ULONG cls, void* info, ULONG len, ULONG* retLen)
 {
     LONG st = pIatNtQIP_(proc, cls, info, len, retLen);
@@ -3433,6 +3460,26 @@ static void HookLateModules(void)
 // immediately, and instrument it if it is a pending HookModules target.
 static ULONG_PTR g_hiddenReported2[32]; static int g_nHiddenReported2 = 0;
 
+// SizeOfImage from the mapped PE headers (the shadow/hidden copies keep their
+// headers), so a hidden module is reported with its real size rather than the
+// size of whichever region happens to start at its base.
+static ULONG_PTR ImageSizeAt(ULONG_PTR base)
+{
+    ULONG_PTR size = 0;
+    __try
+    {
+        IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE)
+        {
+            IMAGE_NT_HEADERS* nth = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+            if (nth->Signature == IMAGE_NT_SIGNATURE)
+                size = nth->OptionalHeader.SizeOfImage;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { size = 0; }
+    return size;
+}
+
 static void ResolveCallerAddrs(void)
 {
     LONG nc = InterlockedExchange(&g_nCaddr, 0);
@@ -3463,6 +3510,10 @@ static void ResolveCallerAddrs(void)
             memset(&mb, 0, sizeof(mb));
             if (VirtualQuery((void*)m, &mb, sizeof(mb)) && (ULONG_PTR)mb.BaseAddress == (ULONG_PTR)m)
                 size = mb.RegionSize;
+            {
+                ULONG_PTR pe = ImageSizeAt((ULONG_PTR)m);
+                if (pe > size) size = pe;
+            }
             for (k = 0; k < g_nHiddenReported2; k++) if (g_hiddenReported2[k] == (ULONG_PTR)m) { dup = 1; break; }
             if (!dup && ScanLdr)
             {
@@ -3539,6 +3590,7 @@ static void InstallKernelbaseInterposition(void)
             kb += HookIatName(kbs[i], "NtOpenThread", (void*)HkIatKbNtOt, (void**)&pIatNtOT_);
             kb += HookIatName(kbs[i], "NtCreateKey", (void*)HkIatKbNtCreateKey, (void**)&pIatNtCKey_);
             kb += HookIatName(kbs[i], "NtSetValueKey", (void*)HkIatKbNtSetValueKey, (void**)&pIatNtSVK_);
+            kb += HookIatName(kbs[i], "NtSetSystemInformation", (void*)HkIatKbNtSsi, (void**)&pIatNtSsi_);
         }
         {
             HMODULE nt = FindWorkingNtdll();
@@ -3563,6 +3615,7 @@ static void InstallKernelbaseInterposition(void)
                 if (!pIatNtOT_)   { void* f = (void*)GetProcAddress(nt, "NtOpenThread");               if (f) kb += HookIatByValue(kbs[i], f, (void*)HkIatKbNtOt,   (void**)&pIatNtOT_); }
                 if (!pIatNtCKey_) { void* f = (void*)GetProcAddress(nt, "NtCreateKey");                if (f) kb += HookIatByValue(kbs[i], f, (void*)HkIatKbNtCreateKey, (void**)&pIatNtCKey_); }
                 if (!pIatNtSVK_)  { void* f = (void*)GetProcAddress(nt, "NtSetValueKey");              if (f) kb += HookIatByValue(kbs[i], f, (void*)HkIatKbNtSetValueKey, (void**)&pIatNtSVK_); }
+                if (!pIatNtSsi_)  { void* f = (void*)GetProcAddress(nt, "NtSetSystemInformation");     if (f) kb += HookIatByValue(kbs[i], f, (void*)HkIatKbNtSsi, (void**)&pIatNtSsi_); }
             }
         }
         {
@@ -4521,8 +4574,8 @@ static void RunMonitors(long long n)
         if (MonFiles || MonTempDir) SafeCall(InstallFileWatch);
         if (MemGuardScan) SafeCall(ScanGuardPages);
         if (WatchSharedData) SafeCall(WatchSharedDataTick);
-        if (ScanEh) { CpuTopologyInfo(); VehChainSurvey(1); }
-        if (ScanDrivers) DriversScan(1);
+        if (ScanDrivers) DriversScan(1);          // first: the hypervisor line
+        if (ScanEh) { CpuTopologyInfo(); VehChainSurvey(1); }   // cross-references it
         if (ScanServices) ServicesScan(1);
     }
     if (MonThreads && n % 2 == 0) SafeCall(PollThreads);
@@ -4534,8 +4587,8 @@ static void RunMonitors(long long n)
     if (ScanOtherHooks && HeartbeatSeconds > 0 && n % (HeartbeatSeconds * 4) == 0) SafeCall(ScanRescan);
     if (HeartbeatSeconds > 0 && n % (HeartbeatSeconds * 4) == 2)
     {
-        if (ScanEh) VehChainSurvey(0);
         if (ScanDrivers) DriversScan(0);
+        if (ScanEh) { CpuTopologyInfo(); VehChainSurvey(0); }  // re-probe + chain
         if (ScanServices) ServicesScan(0);
     }
     if (MemGuardScan && n % 20 == 0) SafeCall(ScanGuardPages);
@@ -5583,20 +5636,42 @@ static void VehChainSurvey(int first)
 // CPUID: a hypervisor leaves CPUID.1:ECX[31] set and identifies itself through
 // leaf 0x40000000. A protection that ships its own hypervisor (or runs under
 // one) shows up here; a plain game process on physical hardware does not.
+//
+// This is re-probed every heartbeat and only logged when the state CHANGES, so
+// a hypervisor that is armed mid-session (or unloaded) is caught - and it is
+// cross-referenced against the loaded kernel modules, because a protection
+// hypervisor can be present in kernel space while keeping the CPUID bit clear
+// (seen with hyperkd.sys on Planet Zoo 2).
+static int g_hvState = -1;                  // -1 = unknown, 0 = absent, 1 = present
+static WCHAR g_hvLast[128] = L"";
+// loaded kernel modules that matched ServiceWatch (basenames, with .sys),
+// filled by DriversScan, so the CPUID probe can cross-reference what is
+// actually loaded in kernel space
+static WCHAR g_drvMatch[16][48]; static int g_nDrvMatch = 0;
+
 static void CpuTopologyInfo(void)
 {
     int r[4];
     char vend[16], hvend[16];
     WCHAR wv[64] = L"", wh[64] = L"";
-    int i, hv;
-    WCHAR line[700];
+    int i, hv, stdMax = 0, extMax = 0;
+    WCHAR line[900], state[128], drv[300];
     for (i = 0; i < 16; i++) { vend[i] = 0; hvend[i] = 0; }
     __cpuid(r, 0);
     memcpy(vend, &r[1], 4); memcpy(vend + 4, &r[3], 4); memcpy(vend + 8, &r[2], 4);
     vend[12] = 0;
+    stdMax = r[0];
+    __cpuid(r, 0x80000000);
+    extMax = r[0];
     __cpuid(r, 1);
     hv = (r[2] >> 31) & 1;                      // CPUID.1:ECX[31] hypervisor-present
     MultiByteToWideChar(CP_ACP, 0, vend, -1, wv, 64);
+    drv[0] = 0;
+    for (i = 0; i < g_nDrvMatch; i++)
+    {
+        if (i) StringCchCatW(drv, 300, L", ");
+        StringCchCatW(drv, 300, g_drvMatch[i]);
+    }
     if (hv)
     {
         __cpuid(r, 0x40000000);
@@ -5606,24 +5681,37 @@ static void CpuTopologyInfo(void)
             if (hvend[i] && (hvend[i] < 0x20 || hvend[i] > 0x7E)) hvend[i] = L'.';
         MultiByteToWideChar(CP_ACP, 0, hvend, -1, wh, 64);
         {
-            int maxLeaf = r[0], feat = 0;
-            if (maxLeaf >= 0x40000001) { __cpuid(r, 0x40000001); feat = r[0]; }
-            StringCchPrintfW(line, 700,
-                L"hypervisor: PRESENT - cpu vendor \"%s\", hypervisor vendor \"%s\", leaves 0x40000000-0x%X, feature word 0x%X%s",
-                wv, wh, maxLeaf, feat,
-                WatchMatch(wh) ? L" - that vendor matches ServiceWatch" : L"");
+            int feat = 0;
+            if (r[0] >= 0x40000001) { int r2[4]; __cpuid(r2, 0x40000001); feat = r2[0]; }
+            StringCchPrintfW(line, 900,
+                L"hypervisor: PRESENT - cpu vendor \"%s\", hypervisor vendor \"%s\", hypervisor leaves 0x40000000-0x%X, feature word 0x%X, cpu leaves std 0x%X ext 0x%X%s%s%s",
+                wv, wh, r[0], feat, stdMax, extMax,
+                WatchMatch(wh) ? L" - that vendor matches ServiceWatch" : L"",
+                drv[0] ? L"; ServiceWatch kernel module(s) loaded: " : L"", drv);
         }
-        Write(L"[SYS]", line);
-        CsvRow(L"sys-cpu", wh, line, L"");
+        StringCchPrintfW(state, 128, L"present:%s|%s", wh, drv);
     }
     else
     {
-        StringCchPrintfW(line, 700,
-            L"hypervisor: absent - cpu vendor \"%s\", CPUID.1:ECX[31]=0 (no hypervisor CPUID leaf; a hypervisor-based protection would set it)",
-            wv);
-        Write(L"[SYS]", line);
-        CsvRow(L"sys-cpu", L"none", line, L"");
+        // the interesting case: no CPUID leaf, but a protection driver is loaded
+        StringCchPrintfW(line, 900,
+            L"hypervisor: no CPUID hypervisor leaf (CPUID.1:ECX[31]=0, cpu vendor \"%s\", leaves std 0x%X ext 0x%X)%s%s - a hypervisor can still be present in kernel space without advertising itself",
+            wv, stdMax, extMax,
+            drv[0] ? L"; ServiceWatch kernel module(s) loaded: " : L"", drv);
+        StringCchPrintfW(state, 128, L"absent|%s", drv);
     }
+    if (g_hvState != -1 && _wcsicmp(g_hvLast, state) == 0) return;   // unchanged
+    if (g_hvState != -1)
+    {
+        WCHAR note[600];
+        StringCchPrintfW(note, 600, L"hypervisor state CHANGED since the last probe: %s", state);
+        Write(L"[SYS]", note);
+        CsvRow(L"sys-cpu", L"change", note, L"");
+    }
+    g_hvState = hv;
+    StringCchCopyW(g_hvLast, 128, state);
+    Write(L"[SYS]", line);
+    CsvRow(L"sys-cpu", hv ? (wh[0] ? wh : L"present") : L"none", line, L"");
 }
 
 // ---------------------------------------------------------------- kernel modules
@@ -5682,6 +5770,7 @@ static void DriversScan(int first)
     if (!ScanDrivers) return;
     q = (t_NtQSI)(void*)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation");
     if (!q) return;
+    g_nDrvMatch = 0;
     st = (ULONG)q(11 /* SystemModuleInformation */, NULL, 0, &need);
     if (!need || need > (64u << 20)) return;
     mods = (GC_SYS_MODS*)HeapAlloc(GetProcessHeap(), 0, need + 65536);
@@ -5712,6 +5801,12 @@ static void DriversScan(int first)
         if (!dup && g_nDrvSeen < 512) g_drvSeen[g_nDrvSeen++] = key;
         if (!(ServiceWatchAll || WatchMatch(path) || WatchMatch(base))) continue;
         matches++;
+        if (g_nDrvMatch < 16 && _wcsicmp(base, L"ntoskrnl.exe") != 0 && _wcsicmp(base, L"hal.dll") != 0)
+        {
+            int k2, have = 0;
+            for (k2 = 0; k2 < g_nDrvMatch; k2++) if (_wcsicmp(g_drvMatch[k2], base) == 0) { have = 1; break; }
+            if (!have) StringCchCopyW(g_drvMatch[g_nDrvMatch++], 48, base);
+        }
         if (dup && !first) continue;
         if (!dup) nnew++;
         if (img)
@@ -5745,7 +5840,7 @@ static void DriversScan(int first)
 // without elevation - unlike the object manager's \Driver directory, which
 // returns STATUS_ACCESS_DENIED (0xC0000022) to a normal game process - and it
 // answers a question the loaded-module list cannot: a driver named in the
-// config (e.g. hyperkd.sys / simplesvm.sys / legion.sys) is reported as
+// config (e.g. hyperkd.sys / simplesvm.sys) is reported as
 // installed-but-not-loaded until the game actually starts it, then as loaded.
 typedef LONG (WINAPI* t_RegOpenKeyExW)(HKEY, LPCWSTR, DWORD, REGSAM, PHKEY);
 typedef LONG (WINAPI* t_RegEnumKeyExW)(HKEY, DWORD, LPWSTR, LPDWORD, LPDWORD, LPWSTR, LPDWORD, PFILETIME);
@@ -5849,7 +5944,14 @@ static void InstalledDriversScan(int first)
         StringCchCopyW(g_instDrv[g_nInstDrv].image, 260, img);
         g_instDrv[g_nInstDrv].type = type;
         g_instDrv[g_nInstDrv].start = start;
-        g_instDrv[g_nInstDrv].loaded = DrvIsLoaded(key);
+        // the loaded check must use the DRIVER FILE name, not the service key
+        // name: the protection registers hyperkd.sys under a service called
+        // "artifact", so matching by key name wrongly reported "not loaded"
+        {
+            const WCHAR* ib = wcsrchr(img, L'\\');
+            ib = ib ? ib + 1 : img;
+            g_instDrv[g_nInstDrv].loaded = ib[0] ? DrvIsLoaded(ib) : DrvIsLoaded(key);
+        }
         // entries cached at startup are still reported (once) by the loop
         // below; entries cached later were just logged as newly registered
         g_instDrv[g_nInstDrv].reported = first ? 0 : 1;
@@ -5879,7 +5981,7 @@ static void InstalledDriversScan(int first)
         isMatch = ServiceWatchAll || WatchMatch(g_instDrv[i].name) || WatchMatch(b) || WatchMatch(g_instDrv[i].image);
         if (isMatch)
         {
-            int now = DrvIsLoaded(g_instDrv[i].name);
+            int now = b[0] ? DrvIsLoaded(b) : DrvIsLoaded(g_instDrv[i].name);
             matches++;
             if (now) nloaded++;
             if (!g_instDrv[i].reported || now != g_instDrv[i].loaded)

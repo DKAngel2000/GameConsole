@@ -115,6 +115,7 @@ Two modes, selected by `HookModules`:
   | `ueh set` | `SetUnhandledExceptionFilter` | the top-level filter was replaced; the **previous** filter is printed too |
   | `regkey CREATED` | `NtCreateKey` | a registry key was **created** (not just opened) — who installed this |
   | `regset` | `NtSetValueKey` | a registry value was written: key path (resolved with `NtQueryKey`), value name, type, size and data |
+  | `syst` | `NtSetSystemInformation` | a system-wide information *write* (rare): class, length and the first dword of the payload |
 
   The registry pair is how a service or a **kernel driver is registered**
   (`ImagePath`, `Type`, `Start`), so a driver install reads:
@@ -344,7 +345,7 @@ an emu do *to each other*:
   list, `ServiceWatch` (default includes `denuvo`, `hypervisor`, `hvservice`,
   `vgk`/`vgc`, `vanguard`, `easyanticheat`, `battleye`, `nprotect`, `gameguard`,
   `xigncode`, `arxan`, `vmprotect`, `themis`, `xtrap`) plus the known Denuvo
-  hypervisor driver names `hyperkd`, `simplesvm`, `legion`, and re-check each
+  hypervisor driver names `hyperkd` and `simplesvm`, and re-check each
   heartbeat so a service that starts, stops or appears mid-session is reported.
   `ServiceWatchAll=true` lists everything instead of matches.
 
