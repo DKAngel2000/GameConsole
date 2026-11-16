@@ -3796,6 +3796,36 @@ static ULONG_PTR ImageSizeAt(ULONG_PTR base)
     return size;
 }
 
+// Is this base in the process's real PEB loader list at all? Toolhelp32 can miss
+// modules - a snapshot taken while the loader is busy, or a relinked list returns
+// a short view - and a false "hidden module" is worse than no report at all: on
+// the elevated PB0 run of 2026-11-16 20:22 our own GameConsole.dll, ntdll,
+// KERNEL32, KERNELBASE and even PBZ.exe itself were all labelled hidden because
+// toolhelp's view was stale at that instant (the protection relinks the loader
+// lists, so this is a live hazard, not a one-off). "Hidden" must mean absent from
+// toolhelp32 *and* absent from the PEB lists - which is what dse.dll is.
+static int InPebLoadList(ULONG_PTR base)
+{
+    typedef struct { LIST_ENTRY Load, Memory, Init; void* DllBase; } ENT;
+    LIST_ENTRY* head;
+    LIST_ENTRY* cur;
+    int found = 0, guard = 0;
+    __try
+    {
+        BYTE* peb = (BYTE*)__readgsqword(0x60);     // gs:[0x60] = PEB (no winternl.h here)
+        BYTE* ldr = *(BYTE**)(peb + 0x18);
+        head = (LIST_ENTRY*)(ldr + 0x10);           // InLoadOrderModuleList
+        cur = head->Flink;
+        while (cur && cur != head && guard++ < 20000)
+        {
+            if ((ULONG_PTR)((ENT*)cur)->DllBase == base) { found = 1; break; }
+            cur = cur->Flink;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { found = 0; }
+    return found;
+}
+
 static void ResolveCallerAddrs(void)
 {
     LONG nc = InterlockedExchange(&g_nCaddr, 0);
@@ -3835,14 +3865,29 @@ static void ResolveCallerAddrs(void)
             {
                 WCHAR line[700];
                 if (g_nHiddenReported2 < 32) g_hiddenReported2[g_nHiddenReported2++] = (ULONG_PTR)m;
-                StringCchPrintfW(line, 700,
-                    L"hidden module: %s @0x%llX size 0x%llX type 0x%X protect 0x%X - resolvable by GetModuleHandle, absent from toolhelp32 (verified)",
-                    name, (unsigned long long)(ULONG_PTR)m, (unsigned long long)size,
-                    (unsigned)mb.Type, (unsigned)mb.Protect);
-                Write(L"[SCAN]", line);
-                CsvRow(L"ldr-hidden", name, line, L"");
+                if (InPebLoadList((ULONG_PTR)m))
+                {
+                    // toolhelp did not show it, the real loader list does: a stale
+                    // snapshot, not a hidden module. Say so once (silence would be
+                    // a silent filter) and name its callers from now on.
+                    StringCchPrintfW(line, 700,
+                        L"ldr: %s @0x%llX size 0x%llX is in the PEB loader list but was absent from the toolhelp32 snapshot - stale snapshot, NOT a hidden module",
+                        name, (unsigned long long)(ULONG_PTR)m, (unsigned long long)size);
+                    Write(L"[SCAN]", line);
+                    CsvRow(L"ldr-stale", name, line, L"");
+                }
+                else
+                {
+                    StringCchPrintfW(line, 700,
+                        L"hidden module: %s @0x%llX size 0x%llX type 0x%X protect 0x%X - resolvable by GetModuleHandle, absent from toolhelp32 AND from the PEB loader lists (verified)",
+                        name, (unsigned long long)(ULONG_PTR)m, (unsigned long long)size,
+                        (unsigned)mb.Type, (unsigned)mb.Protect);
+                    Write(L"[SCAN]", line);
+                    CsvRow(L"ldr-hidden", name, line, L"");
+                }
             }
             CallerAddRange((ULONG_PTR)m, size, name, 0, 1);
+            if (InPebLoadList((ULONG_PTR)m)) continue;   // normal module, nothing hidden about it
         }
         if (IsPendingHook(name))
         {

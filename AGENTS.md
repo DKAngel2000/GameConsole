@@ -135,10 +135,59 @@ by the script. Logs land in `<game>\logs\` (`.log` + `.csv`).
    about the protection.
 
    External cross-check: `tools\HostWatcher.c` (`cl /O2 /W3 HostWatcher.c`) polls
-   the DSE state every 50 ms plus the kernel module list and the driver-service
-   table every 500 ms, and prints only transitions. Start it *before* launching
-   the title: it sees the service appear and go away and the driver load/unload,
-   including the teardown a log inside the game cannot survive to record.
+   the DSE state every 50 ms, the process list every 200 ms (creation, exit,
+   parent, elevation flag, command line) and the kernel module list plus the
+   driver-service table every 500 ms, and prints only transitions. Start it
+   *before* launching the title: it sees the service appear and go away, the
+   driver load/unload, and the protection's helper processes, including the
+   teardown a log inside the game cannot survive to record.
+
+   **What the watcher then showed (PB0, 2026-11-16 18:49 and 20:22), and why the
+   install is still not in the game log.**
+
+   *Double-click path* (18:49): `PBZ.exe` (unelevated) spawns
+   `dse_elevator.exe` → UAC `consent.exe` → `RTCORE64.SYS` loads from
+   `%TEMP%\dsedll\` (DSE off) → a **second `PBZ.exe` starts ELEVATED**, as a child
+   of the elevator, while the original and the elevator exit → the three
+   hypervisor images load and RTCore64 unloads (DSE back on) → service `artifact`
+   `START_PENDING` → `RUNNING`. So the game **relaunches itself elevated**; the
+   process we instrument is the second one.
+
+   *Elevated path* (20:22, launched from an elevated prompt by hand): no elevator,
+   no relaunch, one `PBZ.exe` pid 2220 ELEVATED, and the whole protection startup
+   inside its first 1.6 s. The two helpers are spawned by the game and are the
+   answer to "dse via a watchdog" — they are **separate processes**:
+
+   ```
+   20:22:53.161 KERNEL + RTCORE64.SYS      %TEMP%\dsedll\RTCore64.sys      (DSE off)
+   20:22:53.540 PROC   + rundll32.exe  pid 28636 parent 2220 ELEVATED
+                cmd=rundll32.exe "F:\5068070\platform\steam\dse.dll",DseWatchdog 724 0 1
+   20:22:53.540 PROC   + rundll32.exe  pid 28304 parent 2220 ELEVATED
+                cmd=rundll32.exe "F:\5068070\platform\steam\artifact.dll",Watchdog 2220
+   20:22:53.792 KERNEL + HYPERKD.SYS / HYPERHV.DLL / HYPEREVADE.DLL, - RTCORE64.SYS
+   20:22:53.806 SERVICE artifact START_PENDING -> RUNNING (20:22:54.434)
+   ```
+
+   Both watchdogs are `rundll32.exe` hosting the protection's own DLLs — so the
+   SCM calls and the DSE work happen in *those* processes, not in the game, and no
+   hook inside the game could ever see them. (Do not inject into the watchdog:
+   that is the protection's own process, and it is a write into somebody else's
+   code, which is exactly what hard rule 1 forbids.)
+
+   *And the loader is the other half of the problem*: even elevated, the game log
+   still says `process created 20:22:52.714 - this worker started +4761 ms later`,
+   i.e. `gameconsole.dll` is not brought in until ~4.8 s in, long after the
+   protection's ~1.6 s startup. That is the loader's staging of `load_dlls`, not
+   elevation, and it is why the in-process log can never contain the install.
+   The route that does put us at instruction zero without modifying any file:
+   `tools\EarlyLoad.c` — `CreateProcessW(CREATE_SUSPENDED)` + remote
+   `LoadLibraryW(GameConsole.dll)` + resume. Run it from the elevated prompt so
+   the child inherits elevation. The loader's later `LoadLibrary` of the same DLL
+   is then just a refcount bump, so the hooks and the worker are in place before
+   the first instruction. What that should finally put in the log: the game-side
+   `CreateProcessW` of both watchdogs (we hook it in artifact.dll's IAT) with
+   their command lines, and anything artifact/dse do in the game process after
+   that.
 
    **Do not expect `regkey`/`regset` for the service key from the game.** A
    service created through the SCM has its key written by `services.exe`, in
@@ -288,8 +337,11 @@ build.cmd                          # finds VS via vswhere, cl /LD /O2 /W3 -> Gam
 deploy.cmd                         # copies the DLL into a game folder (edit GAME= at the top)
 tools\ScanTest.c                   # the regression harness (below)
 tools\RunReport.ps1 [log]          # summarise/compare a run log (the recipe, scripted)
-tools\HostWatcher.c                # external watcher: DSE + driver load/unload from outside
-                                   #   the game (cl /O2 /W3 HostWatcher.c); start before the title
+tools\HostWatcher.c                # external watcher: DSE + driver load/unload + helper processes
+                                   #   from outside the game (cl /O2 /W3 HostWatcher.c)
+tools\EarlyLoad.c                  # start the game suspended, LoadLibraryW(GameConsole.dll),
+                                   #   then resume - the DLL is in before instruction zero (item 1)
+tools\KmodProbe.c                  # one-shot: are kernel-module ImageBase values real or redacted
 tools\SingleHost.c                 # single-DLL host: LoadLibrary + hammered APIs + ODS + first-chance exception
 tools\peimports.ps1 <pe-file>      # raw PE import dump: proves the binding census is complete
 tools\symlookup.c                  # resolve <image>+<hex-offset> through the image's PDB (dbghelp)
@@ -586,6 +638,15 @@ was patched" is the point of the tool, and a bare pointer is not evidence.
 * Repointing an import table is a *write*, even though it is not code: for a
   module the tool did not load and cannot name through the loader, treat it as
   tampering and leave it alone. The KERNELBASE layer still sees its calls.
+* "Absent from toolhelp32" is **not** enough to call a module hidden: on the
+  elevated PB0 run (2026-11-16 20:22) our own GameConsole.dll, ntdll, KERNEL32,
+  KERNELBASE and PBZ.exe itself were all labelled hidden, because the toolhelp
+  snapshot was stale while the protection was relinking the loader lists. A
+  hidden module must be absent from toolhelp32 **and** from the PEB loader lists
+  (`InPebLoadList`), and when it is only a stale snapshot the line says
+  `ldr: … was absent from the toolhelp32 snapshot - stale snapshot, NOT a hidden
+  module` instead. A false hidden report is not cosmetic: it is what the guard in
+  item 6 keys off, and it corrupts caller naming.
 * `HoldOnCrash=true` + an unhandled crash = a process frozen in `Sleep(INFINITE)`
   ("held open"), which looks exactly like a hang. Set it to false when testing.
 * A service key name is not a driver file name (service `artifact` →
