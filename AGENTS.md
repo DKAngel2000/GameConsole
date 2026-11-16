@@ -17,8 +17,10 @@ remote `origin`). Source-only: `*.dll`, `*.exe`, `*.obj`, `logs/`, `*.log`,
 **Last behaviour-validated commit**: `aaa58ce` ("Log the hypervisor properly,
 fix the loaded-driver check, drop legion") — ScanTest green and all three games
 ran to a normal exit with it. ScanTest was re-run green at `69a499b` on
-2026-11-16 (Win11 x64, VS 2022 Build Tools), so the harness half still holds at
-the tip; the three-game half has **not** been re-run since `aaa58ce`. Update this
+2026-11-16 (Win11 x64, VS 2022 Build Tools) and again with the module-IAT
+registry bridge added on top of it (the commit after `e0b2ede`): exit=0, one
+`regkey`/`regset` each, no duplicates, 0 ESC bytes. The three-game half has
+**not** been re-run since `aaa58ce`. Update this
 line whenever you validate a change, so the next session knows what the last
 *proven* state was (`git log` is the tip; this line is about evidence, not
 recency).
@@ -78,7 +80,10 @@ by the script. Logs land in `<game>\logs\` (`.log` + `.csv`).
    trace" section states outright whether any of that was captured. Take the
    run's `HKLM` service key **name** from the log, not from this note.
    Until then `regkey`/`regset`/`svc`/`syst` and the `[FS]` `.sys` classifier
-   have **no** in-game validation.
+   have **no** in-game validation. The registry half now has a better chance of
+   appearing: the module-IAT **registry bridge** (source map) hooks the same
+   calls inside artifact's own import table, so a shadow `KERNELBASE#1` route no
+   longer hides the key. Harness-validated, not yet game-validated.
 2. **Hidden-module PE-size fix is unvalidated in a game**: `ImageSizeAt` now
    reports `SizeOfImage` instead of the first region (`dse.dll` showed `0x1000`)
    but no hidden module appeared in the last runs to exercise it.
@@ -270,6 +275,7 @@ Verified 2026-11-16 at `69a499b` on Win11 Pro x64 with VS 2022 Build Tools
 | module ranges / shadow naming | `RefreshModuleRanges`, `CensusDescribe` (`NAME#k @base+off`) |
 | IAT hook layer | `HookIatApi`/`HookIatName`/`HookIatByValue`, every `HkIat*`, `InstallIatHooks`, `HookOneModule`, `HookLateModules`, `HookAddPending`/`IsPendingHook`/`HookClearPending`, `InstallKernelbaseInterposition` |
 | KERNELBASE interposition | **20** `Nt*`: file/memory/thread/context probing + `NtCreateKey`/`NtSetValueKey`/`NtSetSystemInformation`; handlers `HkIatKb*`, `RegPathOfKey` (NtQueryKey), `HkIatKbNtSsi` |
+| registry bridge (module IAT) | `HkIatModNtCreateKey`/`HkIatModNtSetValueKey`/`HkIatRegCreateKeyExW`/`HkIatRegSetValueExW` + the shared `RegLogKeyEvent`/`RegLogValueEvent` loggers, so a shadow `KERNELBASE#1` route still shows the driver's key; thread-local `t_regLogged` snapshot in the `Reg*` handlers keeps it to one line when the KERNELBASE layer has already reported the call |
 | census | `CensusBindings`, `CensusAllModules` |
 | surveys | `ScanNtdllHooks`(+`ScanNtdllImage`), `ShadowSurvey`/`DecodeExecPrologue`, `LdrSurvey`/`LdrWalkList` (per-list cycle detection) |
 | exception chain | `VehChainSurvey`, `VehFindLayout` (runtime layout + `RtlEncodePointer`), `VehHandlerOf`, `VehDescribe` |

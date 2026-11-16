@@ -751,6 +751,13 @@ static void CaptureFrames(unsigned __int64* out8)
 
 static __declspec(thread) int inVeh = 0;
 static __declspec(thread) int inHook = 0;
+
+// Registry lines emitted on this thread. The KERNELBASE layer and the
+// module-level registry bridge both watch the same operations, so the bridge
+// snapshots this around a call and stays quiet when the layer already reported
+// it (a shadow KERNELBASE#1 route does not bump it, which is the case the
+// bridge exists for).
+static __declspec(thread) int t_regLogged = 0;
 static int g_ods = 1, g_hold = 0, g_vehOn = 0;
 static void* g_vehCookie = NULL;          // node returned by AddVectoredExceptionHandler
 static volatile LONG g_crashSynced = 0;   // UEH already wrote the report synchronously
@@ -1761,7 +1768,9 @@ static void RegPathOfKey(HANDLE key, WCHAR* out, int cch)
     ULONG ret = 0, n;
     int off, c;
     out[0] = 0;
-    if (!pNtQK_) pNtQK_ = (t_NtQueryKey)(void*)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryKey");
+    // pNtQK_ is resolved once at startup (InstallKernelbaseInterposition).
+    // Never call GetProcAddress here: this runs inside a registry hook, and the
+    // hook path must not touch the loader (hard rule 6).
     if (!pNtQK_ || !key) return;
     if (pNtQK_(key, 3 /* KeyNameInformation */, buf, sizeof(buf), &ret) != 0) return;
     n = *(ULONG*)buf;                                  // length in bytes
@@ -1789,41 +1798,142 @@ static void RegPathOfKey(HANDLE key, WCHAR* out, int cch)
     }
 }
 
+// One reporting path for a registry event, shared by the KERNELBASE layer and
+// the module-level bridge below, so both produce identical lines. t_regLogged
+// counts what has already been reported on this thread.
+static void RegLogKeyEvent(LONG st, const WCHAR* path, DWORD d)
+{
+    if (inHook || !g_hooksActive || g_count >= g_cap) return;
+    if (d != 1 /* REG_CREATED_NEW_KEY */ && !WatchMatch(path)) return;
+    {
+        WCHAR caller[300], msg[1000];
+        inHook = 1;
+        if (DescribeCaller(caller, 300))
+        {
+            StringCchPrintfW(msg, 1000, L"regkey st=0x%08X %s \"%s\"  <- %s",
+                             (unsigned)st, d == 1 ? L"CREATED" : L"opened",
+                             path && path[0] ? path : L"?", caller);
+            EmitHook(msg);
+            t_regLogged++;
+        }
+        inHook = 0;
+    }
+}
+
+static void RegLogValueEvent(HANDLE key, LONG st, const WCHAR* valueName,
+                             ULONG type, const void* data, ULONG size)
+{
+    WCHAR caller[300], msg[1400], path[520], vn[260], val[340];
+    int c;
+    if (inHook || !g_hooksActive || g_count >= g_cap) return;
+    RegPathOfKey(key, path, 520);
+    vn[0] = 0;
+    if (valueName)
+    {
+        __try
+        {
+            c = (int)wcslen(valueName);
+            if (c > 255) c = 255;
+            memcpy(vn, valueName, (size_t)c * sizeof(WCHAR));
+            vn[c] = 0;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { vn[0] = 0; }
+    }
+    val[0] = 0;
+    if (data && size)
+    {
+        if ((type == 1 /* REG_SZ */ || type == 2 /* REG_EXPAND_SZ */) && size >= 2)
+        {
+            int nc = (int)(size / sizeof(WCHAR));
+            if (nc > 160) nc = 160;
+            __try
+            {
+                int k;
+                for (k = 0; k < nc; k++)
+                {
+                    WCHAR ch = ((const WCHAR*)data)[k];
+                    val[k] = (ch >= 0x20 && ch < 0x7F) || ch == 0 ? ch : L'.';
+                    if (ch == 0) break;
+                }
+                val[k] = 0;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) { val[0] = 0; }
+        }
+        else if (type == 4 /* REG_DWORD */ && size == 4)
+        {
+            __try { StringCchPrintfW(val, 340, L"%lu", (unsigned long)*(const DWORD*)data); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { val[0] = 0; }
+        }
+        else
+        {
+            int k, o2 = 0;
+            __try
+            {
+                for (k = 0; k < 12 && (ULONG)k < size; k++)
+                    o2 += StringCchPrintfW(val + o2, 340 - o2, L"%s%02X", k ? L" " : L"", ((const BYTE*)data)[k]);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) { val[0] = 0; }
+        }
+    }
+    inHook = 1;
+    if (DescribeCaller(caller, 300))
+    {
+        StringCchPrintfW(msg, 1400, L"regset st=0x%08X \"%s\"%s%s type=%lu size=%lu%s%s  <- %s",
+                         (unsigned)st, path[0] ? path : L"?",
+                         vn[0] ? L"\\" : L"", vn,
+                         (unsigned long)type, (unsigned long)size,
+                         val[0] ? L" = " : L"", val, caller);
+        EmitHook(msg);
+        t_regLogged++;
+    }
+    inHook = 0;
+}
+
+// A key's path, taken from NtCreateKey's OBJECT_ATTRIBUTES.
+static void RegLogKeyFromOa(LONG st, void* oa_, DWORD d)
+{
+    WCHAR path[520];
+    path[0] = 0;
+    __try
+    {
+        GC_OA2* oa = (GC_OA2*)oa_;
+        if (oa && oa->ObjectName && oa->ObjectName->Buffer && oa->ObjectName->Length)
+        {
+            int n = oa->ObjectName->Length / (int)sizeof(WCHAR);
+            if (n > 255) n = 255;
+            memcpy(path, oa->ObjectName->Buffer, (size_t)n * sizeof(WCHAR));
+            path[n] = 0;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { path[0] = 0; }
+    RegLogKeyEvent(st, path, d);
+}
+
+// Same, from a value write's UNICODE_STRING name.
+static void RegLogValueFromUni(HANDLE key, LONG st, GC_UNI* vname,
+                               ULONG type, void* data, ULONG size)
+{
+    WCHAR vn[260];
+    vn[0] = 0;
+    __try
+    {
+        if (vname && vname->Buffer && vname->Length)
+        {
+            int c = vname->Length / (int)sizeof(WCHAR);
+            if (c > 255) c = 255;
+            memcpy(vn, vname->Buffer, (size_t)c * sizeof(WCHAR));
+            vn[c] = 0;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { vn[0] = 0; }
+    RegLogValueEvent(key, st, vn[0] ? vn : NULL, type, data, size);
+}
+
 static LONG WINAPI HkIatKbNtCreateKey(HANDLE* h, ULONG acc, void* oa_, ULONG idx,
                                       GC_UNI* cls, ULONG opts, ULONG* disp)
 {
     LONG st = pIatNtCKey_(h, acc, oa_, idx, cls, opts, disp);
-    if (!inHook && g_hooksActive && g_count < g_cap)
-    {
-        WCHAR path[520];
-        DWORD d = disp ? *disp : 0;
-        path[0] = 0;
-        __try
-        {
-            GC_OA2* oa = (GC_OA2*)oa_;
-            if (oa && oa->ObjectName && oa->ObjectName->Buffer && oa->ObjectName->Length)
-            {
-                int n = oa->ObjectName->Length / (int)sizeof(WCHAR);
-                if (n > 255) n = 255;
-                memcpy(path, oa->ObjectName->Buffer, (size_t)n * sizeof(WCHAR));
-                path[n] = 0;
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) { path[0] = 0; }
-        if (d == 1 /* REG_CREATED_NEW_KEY */ || WatchMatch(path))
-        {
-            WCHAR caller[300], msg[1000];
-            inHook = 1;
-            if (DescribeCaller(caller, 300))
-            {
-                StringCchPrintfW(msg, 1000, L"regkey st=0x%08X %s \"%s\"  <- %s",
-                                 (unsigned)st, d == 1 ? L"CREATED" : L"opened",
-                                 path[0] ? path : L"?", caller);
-                EmitHook(msg);
-            }
-            inHook = 0;
-        }
-    }
+    RegLogKeyFromOa(st, oa_, disp ? *disp : 0);
     return st;
 }
 
@@ -1831,72 +1941,77 @@ static LONG WINAPI HkIatKbNtSetValueKey(HANDLE key, GC_UNI* vname, ULONG idx,
                                         ULONG type, void* data, ULONG size)
 {
     LONG st = pIatNtSVK_(key, vname, idx, type, data, size);
-    if (!inHook && g_hooksActive && g_count < g_cap)
+    RegLogValueFromUni(key, st, vname, type, data, size);
+    return st;
+}
+
+// ---- module-level registry bridge ----------------------------------------
+// The KERNELBASE layer above only sees the loader-loaded KERNELBASE image. A
+// protection that routes through its own manual-mapped KERNELBASE#1/advapi32#1
+// copies bypasses it completely, which is how a driver install could go
+// unrecorded. These hook the same operations inside the *monitored module's own
+// import table* (hard rule 1: import tables only), which the shadow route
+// cannot dodge. Where both paths fire, the snapshot of t_regLogged keeps it to
+// a single line.
+static t_NtCreateKey pModNtCKey_ = NULL;
+static t_NtSetValueKey pModNtSVK_ = NULL;
+typedef LONG (WINAPI* t_RegCreateKeyExW)(HKEY, LPCWSTR, DWORD, LPWSTR, DWORD, REGSAM,
+                                         LPSECURITY_ATTRIBUTES, PHKEY, LPDWORD);
+typedef LONG (WINAPI* t_RegSetValueExW)(HKEY, LPCWSTR, DWORD, DWORD, const BYTE*, DWORD);
+static t_RegCreateKeyExW pRegCreateKeyExW_ = NULL;
+static t_RegSetValueExW pRegSetValueExW_ = NULL;
+
+static LONG WINAPI HkIatModNtCreateKey(HANDLE* h, ULONG acc, void* oa_, ULONG idx,
+                                       GC_UNI* cls, ULONG opts, ULONG* disp)
+{
+    LONG st = pModNtCKey_(h, acc, oa_, idx, cls, opts, disp);
+    RegLogKeyFromOa(st, oa_, disp ? *disp : 0);
+    return st;
+}
+
+static LONG WINAPI HkIatModNtSetValueKey(HANDLE key, GC_UNI* vname, ULONG idx,
+                                         ULONG type, void* data, ULONG size)
+{
+    LONG st = pModNtSVK_(key, vname, idx, type, data, size);
+    RegLogValueFromUni(key, st, vname, type, data, size);
+    return st;
+}
+
+static LONG WINAPI HkIatRegCreateKeyExW(HKEY root, LPCWSTR sub, DWORD reserved,
+                                        LPWSTR cls, DWORD opts, REGSAM sam,
+                                        LPSECURITY_ATTRIBUTES sa, PHKEY out, LPDWORD disp)
+{
+    int before = t_regLogged;
+    LONG st = pRegCreateKeyExW_(root, sub, reserved, cls, opts, sam, sa, out, disp);
+    if (t_regLogged == before)
     {
-        WCHAR caller[300], msg[1400], path[520], vn[260], val[340];
-        int c;
-        RegPathOfKey(key, path, 520);
-        vn[0] = 0;
-        __try
+        // resolve the resulting handle, so the line carries the full path even
+        // though the caller only gave a subkey name
+        WCHAR path[520];
+        path[0] = 0;
+        if (st == 0 && out && *out) RegPathOfKey(*out, path, 520);
+        if (!path[0] && sub)
         {
-            if (vname && vname->Buffer && vname->Length)
+            __try
             {
-                c = vname->Length / (int)sizeof(WCHAR);
+                int c = (int)wcslen(sub);
                 if (c > 255) c = 255;
-                memcpy(vn, vname->Buffer, (size_t)c * sizeof(WCHAR));
-                vn[c] = 0;
+                memcpy(path, sub, (size_t)c * sizeof(WCHAR));
+                path[c] = 0;
             }
+            __except (EXCEPTION_EXECUTE_HANDLER) { path[0] = 0; }
         }
-        __except (EXCEPTION_EXECUTE_HANDLER) { vn[0] = 0; }
-        val[0] = 0;
-        if (data && size)
-        {
-            if ((type == 1 /* REG_SZ */ || type == 2 /* REG_EXPAND_SZ */) && size >= 2)
-            {
-                int nc = (int)(size / sizeof(WCHAR));
-                if (nc > 160) nc = 160;
-                __try
-                {
-                    int k;
-                    for (k = 0; k < nc; k++)
-                    {
-                        WCHAR ch = ((WCHAR*)data)[k];
-                        val[k] = (ch >= 0x20 && ch < 0x7F) || ch == 0 ? ch : L'.';
-                        if (ch == 0) break;
-                    }
-                    val[k] = 0;
-                    if (k < nc) nc = k;
-                }
-                __except (EXCEPTION_EXECUTE_HANDLER) { val[0] = 0; }
-            }
-            else if (type == 4 /* REG_DWORD */ && size == 4)
-            {
-                __try { StringCchPrintfW(val, 340, L"%lu", (unsigned long)*(DWORD*)data); }
-                __except (EXCEPTION_EXECUTE_HANDLER) { val[0] = 0; }
-            }
-            else
-            {
-                int k, o2 = 0;
-                __try
-                {
-                    for (k = 0; k < 12 && (ULONG)k < size; k++)
-                        o2 += StringCchPrintfW(val + o2, 340 - o2, L"%s%02X", k ? L" " : L"", ((BYTE*)data)[k]);
-                }
-                __except (EXCEPTION_EXECUTE_HANDLER) { val[0] = 0; }
-            }
-        }
-        inHook = 1;
-        if (DescribeCaller(caller, 300))
-        {
-            StringCchPrintfW(msg, 1400, L"regset st=0x%08X \"%s\"%s%s type=%lu size=%lu%s%s  <- %s",
-                             (unsigned)st, path[0] ? path : L"?",
-                             vn[0] ? L"\\" : L"", vn,
-                             (unsigned long)type, (unsigned long)size,
-                             val[0] ? L" = " : L"", val, caller);
-            EmitHook(msg);
-        }
-        inHook = 0;
+        RegLogKeyEvent(st, path, disp ? *disp : 0);
     }
+    return st;
+}
+
+static LONG WINAPI HkIatRegSetValueExW(HKEY key, LPCWSTR name, DWORD reserved,
+                                       DWORD type, const BYTE* data, DWORD size)
+{
+    int before = t_regLogged;
+    LONG st = pRegSetValueExW_(key, name, reserved, type, data, size);
+    if (t_regLogged == before) RegLogValueEvent(key, st, name, type, data, size);
     return st;
 }
 
@@ -3368,6 +3483,18 @@ static int HookOneModule(HMODULE mod, const WCHAR* modName)
                         if (f && HookIatByValue(mod, f, (void*)HkIatNtOpen, (void**)&pIatNtOpen_))
                         { WCHAR msg[300]; StringCchPrintfW(msg, 300, L"(iat) NtOpenFile (ordinal import) hooked in %s", modName); HookNote(msg); hooked++; }
                     }
+                    if (!pModNtCKey_)
+                    {
+                        void* f = (void*)GetProcAddress(nt, "NtCreateKey");
+                        if (f && HookIatByValue(mod, f, (void*)HkIatModNtCreateKey, (void**)&pModNtCKey_))
+                        { WCHAR msg[300]; StringCchPrintfW(msg, 300, L"(iat) NtCreateKey (ordinal/shadow import) hooked in %s", modName); HookNote(msg); hooked++; }
+                    }
+                    if (!pModNtSVK_)
+                    {
+                        void* f = (void*)GetProcAddress(nt, "NtSetValueKey");
+                        if (f && HookIatByValue(mod, f, (void*)HkIatModNtSetValueKey, (void**)&pModNtSVK_))
+                        { WCHAR msg[300]; StringCchPrintfW(msg, 300, L"(iat) NtSetValueKey (ordinal/shadow import) hooked in %s", modName); HookNote(msg); hooked++; }
+                    }
                     if (!pIatNtTerm_)
                     {
                         void* f = (void*)GetProcAddress(nt, "NtTerminateProcess");
@@ -3400,6 +3527,17 @@ static int HookOneModule(HMODULE mod, const WCHAR* modName)
                         if (g_writes) hooked += HookIatApi(mod, "CopyFileExW", (void*)HkIatCopyFileExW, (void**)&pCopyF_, modName);
                         if (g_writes) hooked += HookIatApi(mod, "DeleteService", (void*)HkIatDeleteService, (void**)&pDelSvc_, modName);
                         hooked += HookIatApi(mod, "OpenSCManagerW", (void*)HkIatOpenSCManagerW, (void**)&pOpenSCM_, modName);
+                        // Registry bridge: a driver is registered by writing the
+                        // service key (ImagePath/Type/Start). A protection that
+                        // routes through a manual-mapped KERNELBASE#1/advapi32#1
+                        // never reaches the KERNELBASE layer, so watch the same
+                        // operations in this module's own import table too.
+                        hooked += HookIatApi(mod, "NtCreateKey", (void*)HkIatModNtCreateKey, (void**)&pModNtCKey_, modName);
+                        hooked += HookIatApi(mod, "ZwCreateKey", (void*)HkIatModNtCreateKey, (void**)&pModNtCKey_, modName);
+                        hooked += HookIatApi(mod, "NtSetValueKey", (void*)HkIatModNtSetValueKey, (void**)&pModNtSVK_, modName);
+                        hooked += HookIatApi(mod, "ZwSetValueKey", (void*)HkIatModNtSetValueKey, (void**)&pModNtSVK_, modName);
+                        hooked += HookIatApi(mod, "RegCreateKeyExW", (void*)HkIatRegCreateKeyExW, (void**)&pRegCreateKeyExW_, modName);
+                        hooked += HookIatApi(mod, "RegSetValueExW", (void*)HkIatRegSetValueExW, (void**)&pRegSetValueExW_, modName);
                         hooked += HookIatApi(mod, "MessageBoxW", (void*)HkIatMessageBoxW, (void**)&pMsgBox_, modName);
                         hooked += HookIatApi(mod, "IsDebuggerPresent", (void*)HkIatIsDebuggerPresent, (void**)&pIsDbg_, modName);
                         hooked += HookIatApi(mod, "VirtualQuery", (void*)HkIatVirtualQuery, (void**)&pVQuery_, modName);
@@ -3594,6 +3732,9 @@ static void InstallKernelbaseInterposition(void)
         }
         {
             HMODULE nt = FindWorkingNtdll();
+            // resolved here, on the worker, so RegPathOfKey never reaches for the
+            // loader from inside a hook (hard rule 6)
+            if (!pNtQK_) pNtQK_ = (t_NtQueryKey)(void*)GetProcAddress(nt, "NtQueryKey");
             for (i = 0; i < nkb; i++)
             {
                 if (g_writes && !pIatNtCreate_) { void* f = (void*)GetProcAddress(nt, "NtCreateFile"); if (f) kb += HookIatByValue(kbs[i], f, (void*)HkIatKbNtCreate, (void**)&pIatNtCreate_); }

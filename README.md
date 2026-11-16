@@ -223,7 +223,10 @@ Two modes, selected by `HookModules`:
   `NtOpenFile` imports by ordinal), memory (`VirtualAlloc`/`Protect`/`Free`), processes
   (`CreateProcessW`, `ShellExecuteW`, `TerminateProcess`), threads (`SuspendThread`,
   `ResumeThread`, `SetThreadContext`, `GetThreadContext`), services (`CreateServiceW`,
-  `StartServiceW`, `DeleteService`, `OpenSCManagerW`), `LoadLibraryA/W`,
+  `StartServiceW`, `DeleteService`, `OpenSCManagerW`), the registry
+  (`NtCreateKey`/`ZwCreateKey`/`NtSetValueKey`/`ZwSetValueKey`/`RegCreateKeyExW`/
+  `RegSetValueExW` — this is how a driver's service key gets its `ImagePath`),
+  `LoadLibraryA/W`,
   `GetProcAddress`, `MessageBoxW`, `IsDebuggerPresent`, `CreateDirectoryW`.
   **No code bytes are modified anywhere** — import tables are data — so this coexists
   safely with mods that inline-hook ntdll themselves.
@@ -278,6 +281,14 @@ Two modes, selected by `HookModules`:
   [HOOK] regkey st=0x00000000 CREATED "\REGISTRY\MACHINE\SYSTEM\ControlSet001\Services\hyperkd"  <- artifact.dll+0x27140
   [HOOK] regset st=0x00000000 "\REGISTRY\MACHINE\...\Services\hyperkd"\ImagePath type=2 size=78 = \SystemRoot\System32\drivers\hyperkd.sys  <- artifact.dll+0x271C0
   ```
+
+  The KERNELBASE layer only sees the loader-loaded KERNELBASE image. A protection
+  that routes its own calls through a manual-mapped `KERNELBASE#1`/`advapi32#1`
+  copy would bypass it, so the **same registry calls are hooked inside the
+  instrumented module's own import table** as well. When a call passes through
+  both, only one line is printed (the module-side handler notices that the
+  layer already reported it); when it only passes through the shadow copy, the
+  module-side hook still records it.
 
 - **Hook targets that load later** (`HookModules`/`HookExe`). artifact/dse load
   *after* this DLL, so a name that cannot be resolved at startup is not dropped:
