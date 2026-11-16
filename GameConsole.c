@@ -140,6 +140,7 @@ static int ScanDrivers = 1;          // loaded kernel modules
 static int ServiceWatchAll = 0;      // list everything, not just the watch list
 static int HookExe = 1;              // also instrument the game exe's IAT
 static int HookHiddenModules = 0;    // rewrite a hidden module's IAT (off: a crash suspect)
+static int HookDelayMs = 0;          // defer all IAT writes N ms (see the setting's comment)
 static WCHAR ServiceWatch[400] = L"denuvo,hypervisor,hvservice,hyperkd,simplesvm,vgk,vgc,vanguard,easyanticheat,battleye,beservice,bedaisy,nprotect,gameguard,xigncode,arxan,vmprotect,themis,xtrap";
 #define MAX_SHADOWSEEN 64
 static ULONG_PTR g_shadowSeen[MAX_SHADOWSEEN]; static int g_nShadowSeen = 0;
@@ -253,6 +254,7 @@ static const Opt Opts[] = {
     { "HookModules", "", "Comma-separated module names whose IAT is instrumented, e.g. artifact.dll. Empty = no per-module IAT hooks, but the KERNELBASE interposition layer is still installed and logs ALL callers" },
     { "HookExe", "false", "Also instrument the game executable's own import table. OFF by default: a Denuvo-protected exe checks its own imports, and repointing them can make it fail its own tamper check (seen as 'corrupt pak index' in UE titles). Turn on only when you need the exe's own first-hop calls" },
     { "HookHiddenModules", "false", "Instrument the import table of a module that is in no loader list (found only by caller address, e.g. a protection helper). OFF by default: such a module is deliberately hidden from the loader, and repointing its imports while it runs has killed the game at that exact moment three times out of three. It is still detected, censused and reported when this is false" },
+    { "HookDelayMs", "0", "Wait this many ms after startup before the first IAT write. 0 = install immediately (normal, loaded by the mod loader). Set it (e.g. 8000) when the DLL is injected at instruction zero with tools\\EarlyLoad.c: a protected module that finds its import table repointed *before* its own startup fails its tamper check and aborts the session ('something went wrong' + a support.codefusion.technology/antitamper link). Everything read-only (surveys, DSE sampling, module log) still runs from t=0" },
     { "MaxHookReports", "2000", "Cap on hook log lines so a chatty caller cannot flood the console" },
     { "#", "", "Read-only survey: what OTHER code has already inline-hooked ntdll" },
     { "ScanOtherHooks", "true", "Read-only ntdll survey: report EVERY export whose entry is a jump instead of a clean syscall stub, classified - hooked by other module / same-image alias / NON-EXPORT same-image target (cave). Runs at startup and re-runs each heartbeat (new sites only). Never writes anything" },
@@ -487,6 +489,7 @@ static void LoadSettings(void)
     ScanEh = B("ScanEh"); ScanServices = B("ScanServices"); ScanDrivers = B("ScanDrivers");
     ServiceWatchAll = B("ServiceWatchAll");
     HookExe = B("HookExe"); HookHiddenModules = B("HookHiddenModules");
+    HookDelayMs = I("HookDelayMs");
     TrimToW(V("ServiceWatch"), ServiceWatch, 400);
     MemGuardScan = B("MemGuardScan"); CsvExport = B("CsvExport"); MemGuardAll = B("MemGuardAll");
 }
@@ -4545,6 +4548,9 @@ static void DrainVehEvents(void)
 
 // ---------------------------------------------------------------- monitors
 static int g_monInit = 0;
+static int g_hooksInstalled = 0;            // set when the (possibly deferred) IAT writes went in
+static ULONGLONG g_hooksAt = 0;             // GetTickCount64 deadline for HookDelayMs
+static void InstallHooks(void);
 
 static void LogStartupInfo(void)
 {
@@ -4951,6 +4957,14 @@ static void ServicesScan(int first);
 
 static void RunMonitors(long long n)
 {
+    if (HookApis && !g_hooksInstalled && g_hooksAt && GetTickCount64() >= g_hooksAt)
+    {
+        g_hooksInstalled = 1;
+        g_hooksAt = 0;
+        InstallHooks();                       // worker-side, nothing else running
+        Trace(L"hooks installed (deferred)");
+        Write(L"[INFO]", L"hooks: IAT writes are in now - the protection's own startup is behind us");
+    }
     if (!g_monInit)
     {
         g_monInit = 1;
@@ -7004,7 +7018,20 @@ static DWORD WINAPI WorkerThread(LPVOID param)
     Trace(L"veh/crash capture installed");
     InstallModuleLog();
     Trace(L"module log installed");
-    if (HookApis) { InstallHooks(); Trace(L"hooks installed"); }
+    if (HookApis && HookDelayMs <= 0) { g_hooksInstalled = 1; InstallHooks(); Trace(L"hooks installed"); }
+    else if (HookApis)
+    {
+        // Injected at instruction zero (EarlyLoad): hold every IAT write back
+        // until the protection has finished its own startup, or it fails its
+        // tamper check and the session dies with Denuvo's "something went wrong"
+        // dialog. Read-only work is unaffected - it is already running.
+        WCHAR msg[300];
+        g_hooksAt = GetTickCount64() + (ULONGLONG)HookDelayMs;
+        StringCchPrintfW(msg, 300,
+            L"hooks: IAT writes deferred by HookDelayMs=%d ms - a protected module must not see its imports repointed before its own startup; read-only capture is already live",
+            HookDelayMs);
+        Write(L"[INFO]", msg);
+    }
     // Hooks are in - now the deferred, slower setup can happen.
     SetupConsole();
     Trace(L"console ready");
