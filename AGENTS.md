@@ -29,8 +29,8 @@ ScanTest was re-run green on 2026-11-16 (Win11 x64, VS 2022 Build Tools) at
 `69a499b`, again with the module-IAT registry bridge on top of `e0b2ede`, again
 at `8975eb6` with the code-integrity monitor, the direct-ntdll module probes
 (`qit`/`qvif`) and the returned-data previews, at `b645e8f` with the `qit(iat)`
-layer tag, and again with the startup reorder + 3 s DSE window (commit after
-`b645e8f`): exit=0, one `regkey`/`regset` each, 8 FF25 sites, VEH chain 1→2,
+layer tag, and again at `630b2fd` with the startup reorder + 3 s DSE window:
+exit=0, one `regkey`/`regset` each, 8 FF25 sites, VEH chain 1→2,
 decoded `qvmm` data, the DSE baseline line present again after the reorder, 0 ESC
 bytes, 0 unattributed callers. The startup-reorder build is what is deployed in
 all three game folders now, but **no game has run on it yet** — the three-game
