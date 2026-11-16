@@ -6234,7 +6234,13 @@ static void DriversScan(int first)
         MultiByteToWideChar(CP_ACP, 0, (const char*)m->FullPathName, -1, path, 300);
         base = wcsrchr(path, L'\\');
         base = base ? base + 1 : path;
-        if (!img) { img = (ULONG_PTR)m->MappedBase; zeroBase++; }
+        // ImageBase is redacted (zero) for an ordinary caller, and MappedBase is
+        // NOT a usable substitute: it is not an image base, and on this box it
+        // carried text that printed as `hyperkd.sys @0x7465536C6F72746E` ("nrolSet"
+        // - a fragment of "CurrentControlSet"). Report a base only when it is a
+        // canonical kernel address; otherwise say the base is redacted and keep
+        // the exact facts (name, size, load order).
+        if (!img || img < 0xFFFF800000000000ull) { img = 0; zeroBase++; }
         // record EVERY loaded module by base name (not only matches), so the
         // registry view can ask whether a driver service is currently loaded;
         // nothing is logged for the ones that do not match
@@ -6256,7 +6262,7 @@ static void DriversScan(int first)
                              base, (unsigned long long)img,
                              (unsigned)m->ImageSize, (unsigned)m->LoadOrderIndex, path);
         else
-            StringCchPrintfW(line, 900, L"driver: %s size 0x%X load-order %u - kernel module matching ServiceWatch: %s",
+            StringCchPrintfW(line, 900, L"driver: %s size 0x%X load-order %u (base redacted for this caller) - kernel module matching ServiceWatch: %s",
                              base,
                              (unsigned)m->ImageSize, (unsigned)m->LoadOrderIndex, path);
         Write(L"[KRNL]", line);

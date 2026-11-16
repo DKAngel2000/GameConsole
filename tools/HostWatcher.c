@@ -30,6 +30,7 @@
 
 #include <windows.h>
 #include <winsvc.h>
+#include <tlhelp32.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -81,10 +82,22 @@ typedef struct {
     int   present;             // seen in the current enumeration
 } SVCENT;
 
+#define MAXPROCS 1024
+typedef struct {
+    DWORD pid;
+    DWORD ppid;
+    WCHAR name[MAXNAME];
+    int   elevated;            // token says the process runs elevated (-1 unknown)
+    int   present;
+} PROCENT;
+
 static MODENT g_mods[MAXMODS];
 static int    g_nMods;
 static SVCENT g_svcs[MAXSVCS];
 static int    g_nSvcs;
+static PROCENT g_procs[MAXPROCS];
+static int    g_nProcs;
+static int    g_procBaselineDone;
 
 static ULONG  g_ci = 0xFFFFFFFFu;
 static int    g_ciUnavailable;
@@ -350,6 +363,115 @@ static void PollServices(const WCHAR* extraCsv)
     CloseServiceHandle(scm);
 }
 
+// ---------------------------------------------------------------- processes
+// Who runs the protection's startup? The game auto-elevates to run its helper,
+// so the install can happen in a *different* (elevated) process from the one our
+// DLL is loaded into - which decides whether an in-process hook could ever see
+// the SCM calls. Tracking process creation/exit (and whether the process is
+// elevated) answers that from outside, with no injection and no modification of
+// anything on disk.
+// OpenProcessToken + TokenElevation needs only PROCESS_QUERY_LIMITED_INFORMATION,
+// which is granted for same-user processes including elevated siblings.
+static int IsElevated(DWORD pid)
+{
+    HANDLE p, tok;
+    TOKEN_ELEVATION el;
+    DWORD got = 0;
+    int r = -1;
+    p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!p) return -1;
+    if (OpenProcessToken(p, TOKEN_QUERY, &tok))
+    {
+        if (GetTokenInformation(tok, TokenElevation, &el, sizeof(el), &got))
+            r = el.TokenIsElevated ? 1 : 0;
+        CloseHandle(tok);
+    }
+    CloseHandle(p);
+    return r;
+}
+
+static void PollProcesses(void)
+{
+    HANDLE snap;
+    PROCESSENTRY32W pe;
+    PROCENT fresh[MAXPROCS];
+    int nFresh = 0, i, j;
+    WCHAR line[700];
+
+    snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe))
+    {
+        do
+        {
+            if (nFresh >= MAXPROCS) break;
+            if (pe.th32ProcessID == 0 || pe.th32ProcessID == 4) continue;
+            fresh[nFresh].pid = pe.th32ProcessID;
+            fresh[nFresh].ppid = pe.th32ParentProcessID;
+            wcsncpy_s(fresh[nFresh].name, MAXNAME, pe.szExeFile, _TRUNCATE);
+            fresh[nFresh].elevated = IsElevated(pe.th32ProcessID);
+            nFresh++;
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    if (!nFresh) return;
+
+    if (g_procBaselineDone)
+    {
+        for (i = 0; i < nFresh; i++)
+        {
+            int found = 0;
+            for (j = 0; j < g_nProcs && !found; j++)
+                if (g_procs[j].pid == fresh[i].pid) found = 1;
+            if (!found)
+            {
+                _snwprintf_s(line, _countof(line), _TRUNCATE,
+                             L"PROC    + %-28s pid %-6u parent %-6u %s",
+                             fresh[i].name, fresh[i].pid, fresh[i].ppid,
+                             fresh[i].elevated == 1 ? L"ELEVATED" :
+                             fresh[i].elevated == 0 ? L"not elevated" : L"(elevation unknown)");
+                Emit(line);
+            }
+        }
+        for (j = 0; j < g_nProcs; j++)
+        {
+            int found = 0;
+            for (i = 0; i < nFresh && !found; i++)
+                if (g_procs[j].pid == fresh[i].pid) found = 1;
+            if (!found)
+            {
+                _snwprintf_s(line, _countof(line), _TRUNCATE,
+                             L"PROC    - %-28s pid %u exited", g_procs[j].name, g_procs[j].pid);
+                Emit(line);
+            }
+        }
+    }
+    else
+    {
+        // first pass: report only what looks like the game/protection crowd, so
+        // the baseline does not become a 200-line process dump
+        for (i = 0; i < nFresh; i++)
+        {
+            const WCHAR* n = fresh[i].name;
+            if (_wcsicmp(n, L"PBZ.exe") && _wcsicmp(n, L"PlanetZoo2.exe") &&
+                !wcsstr(n, L"FFRS") && !wcsstr(n, L"watchdog") && !wcsstr(n, L"dse") &&
+                !wcsstr(n, L"artifact") && !wcsstr(n, L"Steam"))
+                continue;
+            _snwprintf_s(line, _countof(line), _TRUNCATE,
+                         L"PROC    = %-28s pid %-6u parent %-6u %s (at watcher start)",
+                         n, fresh[i].pid, fresh[i].ppid,
+                         fresh[i].elevated == 1 ? L"ELEVATED" :
+                         fresh[i].elevated == 0 ? L"not elevated" : L"(elevation unknown)");
+            Emit(line);
+        }
+        Emit(L"PROC    baseline taken - new processes are reported from now on");
+    }
+    g_procBaselineDone = 1;
+    memcpy(g_procs, fresh, sizeof(PROCENT) * (size_t)nFresh);
+    g_nProcs = nFresh;
+}
+
 // ---------------------------------------------------------------- DSE
 
 static void PollCi(void)
@@ -433,7 +555,7 @@ int wmain(int argc, wchar_t** argv)
         // short); the module list and the service table on every tenth poll,
         // because enumerating them is the expensive part of the loop.
         PollCi();
-        if (n++ % 10 == 0) { PollModules(); PollServices(extra); }
+        if (n++ % 10 == 0) { PollModules(); PollServices(extra); PollProcesses(); }
         Sleep((DWORD)pollMs);
     }
 
