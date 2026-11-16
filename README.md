@@ -279,8 +279,14 @@ Two modes, selected by `HookModules`:
 
   | line | API | what it reveals |
   |---|---|---|
-  | `qit class=N` | `NtQueryInformationThread` | thread-info reads — start address, hide-from-debugger read-back |
+  | `qit(iat) class=N` | `NtQueryInformationThread` | thread-info reads — start address, hide-from-debugger read-back |
   | `qvif class=N serial=… dev=… fs="…"` | `NtQueryVolumeInformationFile` | **hardware fingerprinting**: volume serial number and creation time, device type/characteristics, file-system name |
+
+  `NtQueryInformationThread` is hooked in two places (the KERNELBASE layer and
+  the module's own import table), so the tag says which one saw the call: a bare
+  `qit` line came through KERNELBASE, `qit(iat)` can only come from the slot
+  inside the monitored module. That is how an installed-but-never-fired module
+  hook is visible instead of being assumed to work.
 
   Several probe lines now carry the **data**, not just the call: `qip`/`qit`
   append the first 16 bytes the OS returned, `qvmm` decodes the

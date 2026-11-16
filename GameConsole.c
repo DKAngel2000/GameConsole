@@ -2245,8 +2245,12 @@ static LONG WINAPI HkIatKbNtGct(HANDLE th, void* ctx)
 
 // One report line for NtQueryInformationThread, shared by the KERNELBASE layer
 // and the module-level hook below (artifact.dll imports it straight from ntdll,
-// so the layer - which watches KERNELBASE's own imports - never sees it).
-static void LogQit(LONG st, ULONG cls, HANDLE th, const void* info, ULONG len)
+// so the layer - which watches KERNELBASE's own imports - never sees it). The
+// tag says which of the two saw the call, because both can and the answer is
+// not cosmetic: a `qit` line whose caller is the game exe came through
+// KERNELBASE, while `qit(iat)` can only mean the slot inside the monitored
+// module - so an installed-but-never-fired module hook is visible as such.
+static void LogQit(LONG st, ULONG cls, HANDLE th, const void* info, ULONG len, int viaModule)
 {
     if (inHook || !g_hooksActive || g_count >= g_cap) return;
     {
@@ -2256,7 +2260,8 @@ static void LogQit(LONG st, ULONG cls, HANDLE th, const void* info, ULONG len)
         inHook = 1;
         if (DescribeCaller(caller, 300))
         {
-            StringCchPrintfW(msg, 900, L"qit    st=0x%08X class=%lu t=0x%llX%s  <- %s",
+            StringCchPrintfW(msg, 900, L"%s st=0x%08X class=%lu t=0x%llX%s  <- %s",
+                             viaModule ? L"qit(iat)" : L"qit    ",
                              (unsigned)st, cls, (unsigned long long)(ULONG_PTR)th, back, caller);
             EmitHook(msg);
         }
@@ -2266,7 +2271,7 @@ static void LogQit(LONG st, ULONG cls, HANDLE th, const void* info, ULONG len)
 static LONG WINAPI HkIatKbNtQit(HANDLE th, ULONG cls, void* info, ULONG len, ULONG* ret)
 {
     LONG st = pIatNtQIT_(th, cls, info, len, ret);
-    LogQit(st, cls, th, info, len);
+    LogQit(st, cls, th, info, len, 0);
     return st;
 }
 
@@ -2278,7 +2283,7 @@ static t_NtQIT pModNtQIT_ = NULL;
 static LONG WINAPI HkIatModNtQit(HANDLE th, ULONG cls, void* info, ULONG len, ULONG* ret)
 {
     LONG st = pModNtQIT_(th, cls, info, len, ret);
-    LogQit(st, cls, th, info, len);
+    LogQit(st, cls, th, info, len, 1);
     return st;
 }
 

@@ -337,10 +337,13 @@ Tags: `[INFO]` `[MOD]` `[THR]` `[MEM]` `[NET]` `[FS]` `[HB]` `[SD]` `[ODS]`
 `[<file.log>]`, plus `[raw]` for the game's own console output.
 
 Hook kinds on `[HOOK]` lines: `create/open/read/write/…` (file+memory),
-`qip/sit/sip/qit/qvif/setctx/getctx/cthex/avm/rvm/wvm/qvmm/openthr` (anti-debug,
-fingerprinting and mutual probing), `veh add|remove`, `veh add continue`,
-`ueh set`, `regkey` (CREATED only), `regset`, `syst` (`NtSetSystemInformation`),
-`svc openmgr|create|start|delete`, `gpa`, `iat`.
+`qip/sit/sip/qit/qit(iat)/qvif/setctx/getctx/cthex/avm/rvm/wvm/qvmm/openthr`
+(anti-debug, fingerprinting and mutual probing), `veh add|remove`,
+`veh add continue`, `ueh set`, `regkey` (CREATED only), `regset`, `syst`
+(`NtSetSystemInformation`), `svc openmgr|create|start|delete`, `gpa`, `iat`.
+`qit` is logged by two layers; the `(iat)` suffix marks the module's own import
+slot, so a hook that is installed but never fires cannot be mistaken for one
+that works.
 
 Data now appears on the probe lines, not just the call: `qip`/`qit` append the
 first 16 bytes the OS returned, `qvmm` decodes the returned
