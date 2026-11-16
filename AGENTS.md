@@ -33,15 +33,125 @@ layer tag, at `630b2fd` with the startup reorder + 3 s DSE window, and again wit
 the hidden-module guard and the process-start diagnostic (`9391ed4`):
 exit=0, one `regkey`/`regset` each, 8 FF25 sites, VEH chain 1→2, decoded `qvmm`
 data, the DSE baseline line and `process created … worker started +N ms later`,
-0 ESC bytes, 0 unattributed callers. The hidden-module-guard build is what is
-deployed in all three game folders now, but **no game has yet survived a session
-on a build with the guard**: the three-game evidence above is `8975eb6`, and the
-three PB0 runs at 14:14/14:15/14:16 (on `630b2fd`) all died at the hidden-module
-step reported in item 6. Until PB0 runs clean on it, treat the guard as
-unvalidated in a game. Update
+0 ESC bytes, 0 unattributed callers.
+
+**Build ↔ run map for 2026-11-16** (deployed hash → repo commit → what it ran):
+`1E3C7FC0` = `9391ed4` (hidden-module guard) → **all three titles clean at 17:22/
+17:23/17:25**, the run that validated the guard; `660B39C4` = `8b75f7b` (kernel
+base redaction + watcher process tracking) → **PB0 clean at 20:22** (elevated
+launch); `9D09CCCA` = `3b04943` (hidden = toolhelp AND PEB) → the 21:11 EarlyLoad
+run that died on Denuvo's anti-tamper page; `2385E81A` = `b6358c3` (`HookDelayMs`)
+→ the 22:16/22:18 runs that also failed anti-tamper but were **not** early-loaded
+(`+4374`/`+4402 ms`). Update
 this line whenever you validate a change, so the next session knows what the last
 *proven* state was (`git log` is the tip; this line is about evidence, not
 recency).
+
+### SESSION HANDOVER — 2026-11-16 late evening. Read this block first.
+
+**The guard IS now validated in a game** (this supersedes the paragraph above):
+the 17:22/17:23/17:25 runs of PB0/PZ2/FFRS all went to a normal exit on the
+guard build, and PB0 logged the hidden `dse.dll`, then
+`(iat) dse.dll is a hidden module … reported but NOT instrumented
+(HookHiddenModules=false)`, and ran on for 64 s. The 14:14/14:15/14:16 deaths
+were the by-address IAT write into dse.dll; that is settled.
+
+**Where the deployed state is.** `GameConsole.dll` (343 KB, SHA256 starts
+`251103D7`) is copied into all three game folders and is the build of `b6358c3`,
+the last code commit (later commits are docs and `tools` only). Rebuild and
+redeploy on the new machine with `build.cmd` + the three `Copy-Item`s (see the
+cheat sheet below) — the DLL is gitignored, so it does **not** travel with the
+repo, and MSVC embeds a timestamp, so two builds of the same source have
+different hashes: compare **source commits** across machines, never hashes across
+builds.
+
+**Outstanding trap: `HookDelayMs=8000` is set in PB0's ini right now**
+(`F:\5068070\platform\steam\GameConsole.ini`, added for the EarlyLoad test). It
+must be `0` for ordinary loader launches, or every run there gets its hooks 8 s
+late. The repo's sample `GameConsole.ini` documents both `HookDelayMs` and
+`HookHiddenModules`; the game-folder inis are hand-maintained per machine and are
+**not** in the repo, so on a new box copy the recipe block below into each game
+folder.
+
+**What the last experiments established (PB0):**
+
+* Launched from an **elevated** prompt the game does not relaunch: one `PBZ.exe`,
+  elevated, and the whole protection startup inside its first 1.6 s —
+  `RTCORE64.SYS` from `%TEMP%\dsedll\` at +0.45 s, the two watchdog helpers at
+  +0.75 s, the three hypervisor images and the DSE restore at +1.0 s, service
+  `artifact` RUNNING at +1.6 s. That run (20:22) was **clean**.
+* The watchdogs are `rundll32.exe "…\dse.dll",DseWatchdog 724 0 1` and
+  `rundll32.exe "…\artifact.dll",Watchdog <game pid>` — separate elevated
+  processes, so the SCM calls and the DSE work are not in the game process at all.
+* Double-clicking adds `dse_elevator.exe` + UAC and **relaunches** the game
+  elevated; the process we instrument is the second one.
+* Even elevated, the loader brings `gameconsole.dll` in at **+4.4 to +4.8 s**
+  (`process created … this worker started +N ms later`), i.e. after everything.
+  That number is the fastest way to tell whether a run was early-loaded or not:
+  **small N (tens of ms) = injected at instruction zero; ~4.4 s = the loader did
+  it, and the run says nothing about early capture.**
+* `tools\EarlyLoad.c` (suspended create + remote `LoadLibraryW` + resume) does
+  inject successfully — the 21:11 run printed `LoadLibraryW returned 0xBFD00000
+  (loaded)` — and that run died with **Denuvo's anti-tamper page**
+  (`support.codefusion.technology/antitamper/…`). Cause not fully isolated: with
+  `HookDelayMs=0` our IAT writes land *before* the protection's own startup, which
+  is a new condition (the loader path writes at +4.4 s, after it, and never
+  tripped it).
+* Two later runs (22:16 `HookDelayMs=8000`, 22:18 `HookApis=false`) still failed
+  anti-tamper — but both logged `+4374 ms` / `+4402 ms`, so our DLL was **not**
+  early-loaded in them, and in the `HookApis=false` run there were no writes at
+  all. Those two runs therefore prove nothing about early capture, and they leave
+  two candidates open: (a) EarlyLoad was run from a non-elevated prompt, so the
+  game relaunched and our DLL sat in the discarded first process; (b) Denuvo's
+  anti-tamper state is sticky after the 21:11 failure. `EarlyLoad.exe` now
+  **refuses to run from a non-elevated prompt** (it prints why) so (a) cannot
+  recur silently.
+
+**Next steps, in order:**
+
+1. **Control run A — is the machine's state clean?** Ordinary launch (double-click
+   or started from the elevated prompt, no EarlyLoad), PB0 ini with
+   `HookDelayMs=0`. If PB0 is clean like 20:22, we are free to test EarlyLoad
+   again; if it *still* fails anti-tamper with no injection involved, the
+   protection's state is poisoned (reboot / wait / re-check) and none of the
+   22:1x conclusions stand.
+2. **Control run B — EarlyLoad, elevated, with the watcher running.**
+   `HostWatcher.exe` first, then `EarlyLoad.exe "<game>\PBZ.exe"` from an
+   **Administrator** prompt. In the watcher: if `dse_elevator.exe` appears, the
+   game still relaunched (so EarlyLoad is the wrong tool for that launch); if it
+   does not, and the game log shows a **small** `+N ms`, we finally have t=0
+   capture. Diff from the 20:22 baseline.
+3. If t=0 capture works with `HookDelayMs=8000`: read the `[SYS] code integrity`
+   pair (the first in-process proof of the install — the state is system-wide and
+   sampled every 10 ms), then consider making the watchdog spawns visible without
+   touching artifact.dll by hooking **KERNELBASE's import of
+   `NtCreateUserProcess`** in the interposition layer (idea, not built).
+4. Set `HookDelayMs=0` again.
+5. Then PZ2/FFRS: same recipe; whether PZ2 spawns the same watchdog pair is
+   unknown, and FFRS's older artifact has never shown one.
+
+**Cheat sheet (paths are per-machine; commands are the same):**
+
+```powershell
+cd F:\Projects\GameConsole
+cmd /c build.cmd                                     # -> GameConsole.dll (/LD /O2 /W3)
+foreach ($g in 'F:\5068070\platform\steam','F:\Planet Zoo 2','F:\FINAL FANTASY RESONANCE\FFRS\Binaries\Win64') {
+  Copy-Item GameConsole.dll "$g\GameConsole.dll" -Force }        # deploy
+# harness (ini recipe matters - see the ScanTest section)
+reg delete "HKCU\Software\GameConsoleScanTest" /f
+Copy-Item GameConsole.dll "$env:TEMP\scantest\GameConsole.dll" -Force
+cd "$env:TEMP\scantest"; .\ScanTest.exe; Get-Content .\progress.txt | Select-Object -Last 1
+# tools
+cl /nologo /O2 /W3 tools\HostWatcher.c /Fe:tools\HostWatcher.exe   # from a vcvars64 shell
+cl /nologo /O2 /W3 tools\EarlyLoad.c   /Fe:tools\EarlyLoad.exe     # same
+.\tools\RunReport.ps1 -Dir '<game>\logs'                           # read a run
+```
+
+**Known-good reference logs** (per machine, not in the repo):
+PB0 `GameConsole_20261116_202257_pid2220.log` (elevated, clean, watchdog lines in
+the watcher) and `…_172204_pid25724.log`; PZ2 `…_172357_pid27776.log`; FFRS
+`…_172512_pid25604.log`. The watcher's own transcript from the decisive run is
+saved by the user at `C:\Users\creat\OneDrive\Desktop\hostwatcher.txt`.
 
 **Tooling on the old box (Windows 11, x64)**: MSVC via `vswhere` (no VS project
 files), `git` with the Windows credential manager stored credential for GitHub.
@@ -61,6 +171,8 @@ Three titles were instrumented, all with the **same ini recipe**:
 ```
 HookModules=artifact.dll,dse.dll
 HookExe=false
+HookHiddenModules=false  # never rewrite the import table of a module that hides itself (item 6)
+HookDelayMs=0            # >0 only while testing tools\EarlyLoad.exe; 0 for ordinary launches
 HookApis=true
 GpaThunks=true
 CensusAll=true

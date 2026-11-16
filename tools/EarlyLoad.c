@@ -30,9 +30,32 @@
 #include <windows.h>
 #include <stdio.h>
 
+#pragma comment(lib, "advapi32.lib")
+
 static void fail(const WCHAR* what)
 {
     wprintf(L"EarlyLoad: %s failed (error %lu)\n", what, GetLastError());
+}
+
+// Our own elevation decides the child's. If this prompt is NOT elevated the game
+// sees that, spawns dse_elevator.exe and relaunches itself elevated - so the
+// process we injected into is the one that gets thrown away, the log still shows
+// "worker started +4xxx ms later" (the relaunch loading the DLL normally), and
+// the run tells us nothing. Refuse up front instead of producing another
+// ambiguous failing session.
+static int AmElevated(void)
+{
+    HANDLE tok;
+    TOKEN_ELEVATION el;
+    DWORD got = 0;
+    int r = 0;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok))
+    {
+        if (GetTokenInformation(tok, TokenElevation, &el, sizeof(el), &got))
+            r = el.TokenIsElevated ? 1 : 0;
+        CloseHandle(tok);
+    }
+    return r;
 }
 
 int wmain(int argc, wchar_t** argv)
@@ -86,6 +109,15 @@ int wmain(int argc, wchar_t** argv)
             if (slash) *(slash + 1) = 0;
             wcscat_s(dll, _countof(dll), L"GameConsole.dll");
         }
+    }
+    if (!AmElevated())
+    {
+        wprintf(L"EarlyLoad: this prompt is NOT elevated.\n");
+        wprintf(L"  The game checks and, when unelevated, spawns dse_elevator.exe (UAC) and relaunches\n");
+        wprintf(L"  itself elevated - our injected DLL would sit in the discarded first process, the log\n");
+        wprintf(L"  would still read \"worker started +4xxx ms later\", and the run would prove nothing.\n");
+        wprintf(L"  Run this from an elevated (Administrator) prompt.\n");
+        return 2;
     }
     dllLen = (wcslen(dll) + 1) * sizeof(WCHAR);
     wprintf(L"EarlyLoad: target  %s\n", cmd);
