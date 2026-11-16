@@ -14,21 +14,24 @@ remote `origin`). Source-only: `*.dll`, `*.exe`, `*.obj`, `logs/`, `*.log`,
 `git ls-files --eol` should show `i/lf w/lf` for sources and docs, and
 `i/lf w/crlf` for `*.cmd`/`*.bat` (checkout conversion, by design — not drift).
 
-**Last behaviour-validated commit**: `0cabdee` for the three-game half — the
-deployed DLL in all three folders hashed identical to the repo build, and FFRS
-and PZ2 ran to a normal exit (FFRS's only WER entry is the known cosmetic
-`apphelp.dll` `0xC0000409`; PZ2 left none). PB0 did **not** run to a clean exit
-(see outstanding item 6). Before that, `aaa58ce` had all three games exit
-normally.
+**Last behaviour-validated commit**: `8975eb6` for the three-game half — the
+deployed DLL in all three folders hashed identical to the repo build, and **all
+three** titles ran to a normal exit: PB0 13:02:56→13:04:00, FFRS
+13:02:09→13:02:37, PZ2 13:04:15→13:04:57. FFRS's only WER entry is the known
+cosmetic `apphelp.dll` `0xC0000409`; PB0 and PZ2 left none. That run is also the
+first game-side evidence for the code-integrity monitor (one `[SYS] code
+integrity: options 0x0000C001 (enabled undecoded 0x6) … DSE on` per run, no
+change — the driver was already loaded) and for the module-level ntdll probe
+hooks. Before it, `0cabdee` had all three exit cleanly except PB0 (item 6, now
+explained), and `aaa58ce` before that.
 
 ScanTest was re-run green on 2026-11-16 (Win11 x64, VS 2022 Build Tools) at
-`69a499b`, again with the module-IAT registry bridge on top of `e0b2ede`, and
-again at `8975eb6` with the code-integrity monitor, the direct-ntdll module
-probes (`qit`/`qvif`) and the returned-data previews: exit=0, one
-`regkey`/`regset` each, 8 FF25 sites, VEH chain 1→2, decoded `qvmm` data, 0 ESC
-bytes, 0 unattributed callers. That build is what is deployed in all three game
-folders now, so the next run of any title is the first game-side test of the DSE
-monitor and the module-level `qit`/`qvif` hooks. Update
+`69a499b`, again with the module-IAT registry bridge on top of `e0b2ede`, again
+at `8975eb6` with the code-integrity monitor, the direct-ntdll module probes
+(`qit`/`qvif`) and the returned-data previews, and again at `b645e8f` with the
+`qit(iat)` layer tag: exit=0, one `regkey`/`regset` each, 8 FF25 sites, VEH chain
+1→2, decoded `qvmm` data, 0 ESC bytes, 0 unattributed callers. `b645e8f` is what
+is deployed in all three game folders now. Update
 this line whenever you validate a change, so the next session knows what the last
 *proven* state was (`git log` is the tip; this line is about evidence, not
 recency).
@@ -107,6 +110,13 @@ by the script. Logs land in `<game>\logs\` (`.log` + `.csv`).
    Then run `tools\RunReport.ps1 -Dir <game>\logs`: its "Driver / service install
    trace" section states outright whether any of that was captured. Take the
    run's service key **name** from the log, not from this note.
+
+   The 13:02/13:04 runs confirm the "already installed" state from inside: both
+   PB0 and PZ2 logged `[SVC] service: artifact … state=RUNNING` and
+   `[KRNL] driver: hyperkd.sys` in the first second, **zero** `svc`/`syst` lines,
+   and one `[SYS] code integrity: options 0x0000C001 … DSE on` with no change —
+   i.e. nothing had to be installed, so there was nothing to capture. Delete the
+   key and reboot before expecting item 1.
 2. **Hidden-module PE-size fix — validated in a game** (PB0, 2026-11-16):
    `hidden module: dse.dll @0x7FF9A81B0000 size 0x60000` and
    `hidden module: nvldumdx.dll @0x7FF9A8580000 size 0xD1000`, real
@@ -114,24 +124,25 @@ by the script. Logs land in `<game>\logs\` (`.log` + `.csv`).
    listed in `load_dlls` next to gameconsole.dll, and the census walked its
    imports (21, all `tally sums to 21`).
 3. **dse.dll detection is event-driven**: it is found only when caller
-   attribution catches it calling something we instrument. The PB0 run on
-   2026-11-16 did finally report it (see item 2), but *after* the next heartbeat
-   would have been due, so `HookLateModules` never got to instrument it and the
-   process ended ~4 s later. A session where the protection acts (and survives)
-   is still what is needed to hook it and see its `wvm`/`svc` calls.
+   attribution catches it calling something we instrument. **It never appeared at
+   all in the 13:02/13:04 runs** (`hidden modules: 0` in all three, and no
+   `dse.dll loaded late` line) — because the hypervisor was already installed and
+   running, so the helper had nothing to do. The PB0 run at 12:38 did catch it
+   (item 2) once, after the last heartbeat, so `HookLateModules` never got to
+   instrument it. A session where the protection actually acts — i.e. the
+   install in item 1 — is still what is needed to hook it and see its `wvm`/`svc`
+   calls.
 4. Optional polish: the `[SCAN] ldr: <list> cycles after N distinct entries`
-   lines repeat once per rescan (that is the list size changing, e.g. 88→150→
+   lines repeat once per rescan (that is the list size changing, e.g. 90→150→
    193→194 on PB0). Dedupe to first-report-plus-change if it becomes noisy.
 5. Optional RE: name artifact's VEH handler for PZ2/FFRS. It is *not* in the OS
    chain (private list), so it needs a read-only hunt for the protection's own
    list — nothing yet.
-6. **PB0 ended without a crash report** (2026-11-16 12:38:12): no `[CRASH]`, no
-   `%TEMP%\GameConsole_crash.log`, and no WER `Application Error` entry at all,
-   with the log stopping mid-scan in the same second dse.dll was identified.
-   `EnableCrashHandler`/`WriteCrashFile` were on, so this was not an in-process
-   unhandled exception — the process was terminated. Re-run PB0 before drawing a
-   conclusion: if it dies at the same point again it is reproducible (and the
-   dse census is the suspect); if not, it was a one-off.
+6. **PB0's 12:38 death was a one-off** (resolved 2026-11-16 13:02): re-ran PB0 on
+   the same build path and it ran 13:02:56→13:04:00 to a normal exit — engine
+   shutdown visible in `[raw]` (`Puerts: ~FScriptArrayEx` teardown), no
+   `[CRASH]`, no `%TEMP%\GameConsole_crash.log`, no WER entry, no hidden module
+   this time. Nothing suggests the dse census; do not chase it unless it recurs.
 
 ### How to read a run (quick recipe)
 
@@ -424,6 +435,18 @@ was patched" is the point of the tool, and a bare pointer is not evidence.
   `Dr6=FFFF0FF0`, `Dr7=0x440`, `rip=Dr3=…`), and probe `ProcessDebugPort` (0xC),
   `AmILastThread` (12), `ThreadHideFromDebugger` (0x11) etc. FFRS shows none of
   that; its KUSER_SHARED_DATA mailbox stays `…37133713`.
+* **The module-level ntdll probe hooks are installed but still unexercised**
+  (2026-11-16 13:02/13:04). PB0 and PZ2 log
+  `(iat) NtQueryInformationThread hooked in artifact.dll` and the same for
+  `NtQueryVolumeInformationFile`; FFRS logs neither, because its older artifact
+  does not import them at all. After that nothing arrived through those two
+  slots: every `qit` line named **PBZ.exe** as the caller (so it came through the
+  KERNELBASE layer, class 30 = thread-group information, returning
+  `FF FF 00 00 …`), and `qvif` never appeared once. So artifact either calls
+  those APIs only on a path these sessions did not take (licence/bind at first
+  run) or has cached the pointers in its own table. Do not read "hooked in
+  artifact.dll" as "we see artifact's volume queries"; grep `qit(iat)`/`qvif` in
+  the log to see whether the module's own slot ever executed.
 * **Not the protection**: FFRS's `steam_api64.dll+0x9C381B` throws `0xE06D7363`
   ~100–200× per run.
 
