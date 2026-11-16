@@ -1866,11 +1866,20 @@ static void RegLogValueEvent(HANDLE key, LONG st, const WCHAR* valueName,
         }
         else
         {
+            // REG_BINARY and friends: bounded hex. StringCchPrintfW returns an
+            // HRESULT, not a count, so the offset is advanced by hand.
+            static const WCHAR hx[] = L"0123456789ABCDEF";
             int k, o2 = 0;
             __try
             {
-                for (k = 0; k < 12 && (ULONG)k < size; k++)
-                    o2 += StringCchPrintfW(val + o2, 340 - o2, L"%s%02X", k ? L" " : L"", ((const BYTE*)data)[k]);
+                for (k = 0; k < 12 && (ULONG)k < size && o2 + 4 < 340; k++)
+                {
+                    BYTE b = ((const BYTE*)data)[k];
+                    if (k) val[o2++] = L' ';
+                    val[o2++] = hx[b >> 4];
+                    val[o2++] = hx[b & 0xF];
+                }
+                val[o2] = 0;
             }
             __except (EXCEPTION_EXECUTE_HANDLER) { val[0] = 0; }
         }
@@ -2042,17 +2051,52 @@ static LONG WINAPI HkIatKbNtSsi(ULONG cls, void* info, ULONG len)
     return st;
 }
 
+// A bounded, SEH-guarded hex preview of a caller-owned buffer: "what was
+// actually written" for a cross-process write, "what came back" for an NtQuery.
+// The pointer is never trusted and never read past max bytes, so a bad pointer
+// costs one fault (caught here) rather than the game.
+static int BytesPreview(const void* p, SIZE_T n, WCHAR* out, int cch, int max)
+{
+    static const WCHAR hex[] = L"0123456789ABCDEF";
+    int k, o = 0;
+    if (cch < 8) { if (cch > 0) out[0] = 0; return 0; }
+    if (!p || !n) { out[0] = 0; return 0; }
+    if (n > (SIZE_T)max) n = (SIZE_T)max;
+    __try
+    {
+        out[o++] = L' ';
+        out[o++] = L'[';
+        for (k = 0; k < (int)n && o + 4 < cch; k++)
+        {
+            BYTE b = ((const BYTE*)p)[k];
+            if (k) out[o++] = L' ';
+            out[o++] = hex[b >> 4];
+            out[o++] = hex[b & 0xF];
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        StringCchCopyW(out, (size_t)cch, L" [unreadable]");
+        return 1;
+    }
+    if (o + 2 < cch) { out[o++] = L']'; out[o] = 0; }
+    else out[cch - 1] = 0;
+    return 1;
+}
+
 static LONG WINAPI HkIatKbNtQip(HANDLE proc, ULONG cls, void* info, ULONG len, ULONG* retLen)
 {
     LONG st = pIatNtQIP_(proc, cls, info, len, retLen);
     if (!inHook && g_hooksActive && g_count < g_cap)
     {
-        WCHAR caller[300], msg[700];
+        WCHAR caller[300], msg[900], back[200];
+        back[0] = 0;
+        if (st == 0) BytesPreview(info, len, back, 200, 16);   // what the OS answered
         inHook = 1;
         if (DescribeCaller(caller, 300))
         {
-            StringCchPrintfW(msg, 700, L"qip    st=0x%08X class=%lu len=%lu info=0x%llX  <- %s",
-                             (unsigned)st, cls, len, (unsigned long long)(ULONG_PTR)info, caller);
+            StringCchPrintfW(msg, 900, L"qip    st=0x%08X class=%lu len=%lu%s  <- %s",
+                             (unsigned)st, cls, len, back, caller);
             EmitHook(msg);
         }
         inHook = 0;
@@ -2199,17 +2243,100 @@ static LONG WINAPI HkIatKbNtGct(HANDLE th, void* ctx)
     return st;
 }
 
-static LONG WINAPI HkIatKbNtQit(HANDLE th, ULONG cls, void* info, ULONG len, ULONG* ret)
+// One report line for NtQueryInformationThread, shared by the KERNELBASE layer
+// and the module-level hook below (artifact.dll imports it straight from ntdll,
+// so the layer - which watches KERNELBASE's own imports - never sees it).
+static void LogQit(LONG st, ULONG cls, HANDLE th, const void* info, ULONG len)
 {
-    LONG st = pIatNtQIT_(th, cls, info, len, ret);
-    if (!inHook && g_hooksActive && g_count < g_cap)
+    if (inHook || !g_hooksActive || g_count >= g_cap) return;
     {
-        WCHAR caller[300], msg[700];
+        WCHAR caller[300], msg[900], back[200];
+        back[0] = 0;
+        if (st == 0) BytesPreview(info, len, back, 200, 16);   // what the OS answered
         inHook = 1;
         if (DescribeCaller(caller, 300))
         {
-            StringCchPrintfW(msg, 700, L"qit    st=0x%08X class=%lu t=0x%llX  <- %s",
-                             (unsigned)st, cls, (unsigned long long)(ULONG_PTR)th, caller);
+            StringCchPrintfW(msg, 900, L"qit    st=0x%08X class=%lu t=0x%llX%s  <- %s",
+                             (unsigned)st, cls, (unsigned long long)(ULONG_PTR)th, back, caller);
+            EmitHook(msg);
+        }
+        inHook = 0;
+    }
+}
+static LONG WINAPI HkIatKbNtQit(HANDLE th, ULONG cls, void* info, ULONG len, ULONG* ret)
+{
+    LONG st = pIatNtQIT_(th, cls, info, len, ret);
+    LogQit(st, cls, th, info, len);
+    return st;
+}
+
+// ---- ntdll probes imported directly by a monitored module ----------------
+// Separate trampolines from the KERNELBASE layer: a module's import can be
+// bound to a shadow ntdll copy, so the two originals are not interchangeable.
+static t_NtQIT pModNtQIT_ = NULL;
+
+static LONG WINAPI HkIatModNtQit(HANDLE th, ULONG cls, void* info, ULONG len, ULONG* ret)
+{
+    LONG st = pModNtQIT_(th, cls, info, len, ret);
+    LogQit(st, cls, th, info, len);
+    return st;
+}
+
+// NtQueryVolumeInformationFile: the volume serial number, label and file-system
+// name are hardware/system fingerprints - what a licence check binds a machine
+// to, which is why a protection asks for them. Classes logged:
+// 1 FileFsVolumeInformation, 4 FileFsDeviceInformation, 7 FileFsAttributeInformation.
+typedef LONG (WINAPI* t_NtQvif)(HANDLE, void*, void*, ULONG, ULONG);
+static t_NtQvif pModNtQvif_ = NULL;
+
+static LONG WINAPI HkIatModNtQvif(HANDLE h, void* iosb, void* info, ULONG len, ULONG cls)
+{
+    LONG st = pModNtQvif_(h, iosb, info, len, cls);
+    if (!inHook && g_hooksActive && g_count < g_cap)
+    {
+        WCHAR caller[300], msg[700], detail[160];
+        detail[0] = 0;
+        if (st == 0 && info)
+        {
+            __try
+            {
+                if (cls == 1 && len >= 16)
+                {
+                    // FS_VOLUME_INFO: {LARGE_INTEGER CreationTime; ULONG Serial; ...}
+                    StringCchPrintfW(detail, 160, L" serial=0x%08X",
+                                     *(unsigned*)((BYTE*)info + 8));
+                }
+                else if (cls == 4 && len >= 8)
+                {
+                    // FS_DEVICE_INFO: {ULONG DeviceType; ULONG Characteristics;}
+                    StringCchPrintfW(detail, 160, L" dev=%lu char=0x%lX",
+                                     *(unsigned*)info, *(unsigned*)((BYTE*)info + 4));
+                }
+                else if (cls == 7 && len >= 16)
+                {
+                    // FS_ATTRIBUTE_INFO: {ULONG Attr; LONG MaxNameLen; ULONG NameLen; WCHAR Name[];}
+                    ULONG nl = *(ULONG*)((BYTE*)info + 8);
+                    if (nl >= 2 && nl <= 64 && 12 + nl <= len)
+                    {
+                        int k, n = (int)(nl / sizeof(WCHAR));
+                        WCHAR fs[40];
+                        for (k = 0; k < n && k < 39; k++)
+                        {
+                            WCHAR ch = *(WCHAR*)((BYTE*)info + 12 + k * 2);
+                            fs[k] = (ch >= 0x20 && ch < 0x7F) ? ch : L'.';
+                        }
+                        fs[k] = 0;
+                        StringCchPrintfW(detail, 160, L" fs=\"%s\"", fs);
+                    }
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) { detail[0] = 0; }
+        }
+        inHook = 1;
+        if (DescribeCaller(caller, 300))
+        {
+            StringCchPrintfW(msg, 700, L"qvif   st=0x%08X class=%lu%s  <- %s",
+                             (unsigned)st, cls, detail, caller);
             EmitHook(msg);
         }
         inHook = 0;
@@ -2242,13 +2369,29 @@ static LONG WINAPI HkIatKbNtQvm(HANDLE proc, const void* addr, ULONG cls, void* 
     LONG st = pIatNtQVM_(proc, addr, cls, info, len, ret);
     if (!inHook && g_hooksActive && g_count < g_cap)
     {
-        WCHAR caller[300], msg[800];
+        WCHAR caller[300], msg[900], back[200];
+        back[0] = 0;
+        if (st == 0 && cls == 0 && info && len >= sizeof(MEMORY_BASIC_INFORMATION))
+        {
+            // MemoryBasicInformation: the answer a protection actually uses -
+            // is this page committed? executable? private (i.e. packed) or image?
+            __try
+            {
+                MEMORY_BASIC_INFORMATION* m = (MEMORY_BASIC_INFORMATION*)info;
+                StringCchPrintfW(back, 200, L" base=0x%llX size=0x%llX state=0x%lX prot=0x%lX type=0x%lX",
+                                 (unsigned long long)(ULONG_PTR)m->BaseAddress,
+                                 (unsigned long long)m->RegionSize,
+                                 (unsigned long)m->State, (unsigned long)m->Protect,
+                                 (unsigned long)m->Type);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) { back[0] = 0; }
+        }
         inHook = 1;
         if (DescribeCaller(caller, 300))
         {
-            StringCchPrintfW(msg, 800, L"qvmm   st=0x%08X class=%lu @0x%llX len=0x%llX  <- %s",
+            StringCchPrintfW(msg, 900, L"qvmm   st=0x%08X class=%lu @0x%llX len=0x%llX%s  <- %s",
                              (unsigned)st, cls, (unsigned long long)(ULONG_PTR)addr,
-                             (unsigned long long)len, caller);
+                             (unsigned long long)len, back, caller);
             EmitHook(msg);
         }
         inHook = 0;
@@ -2257,19 +2400,23 @@ static LONG WINAPI HkIatKbNtQvm(HANDLE proc, const void* addr, ULONG cls, void* 
 }
 
 // NtReadVirtualMemory / NtWriteVirtualMemory: cross-process memory access -
-// "who is reading/writing whose memory" (self reads show proc = -1).
+// "who is reading/writing whose memory" (self reads show proc = -1), plus a
+// bounded preview of the bytes: what was read out, or what was written in.
 static LONG WINAPI HkIatKbNtRvm(HANDLE proc, const void* addr, void* buf, SIZE_T len, SIZE_T* got)
 {
     LONG st = pIatNtRVM_(proc, addr, buf, len, got);
     if (!inHook && g_hooksActive && g_count < g_cap)
     {
-        WCHAR caller[300], msg[800];
+        WCHAR caller[300], msg[900], data[220];
+        data[0] = 0;
+        if (st == 0) BytesPreview(buf, (got && *got) ? *got : len, data, 220, 16);
         inHook = 1;
         if (DescribeCaller(caller, 300))
         {
-            StringCchPrintfW(msg, 800, L"rvm    st=0x%08X proc=0x%llX @0x%llX len=0x%llX  <- %s",
+            StringCchPrintfW(msg, 900, L"rvm    st=0x%08X proc=0x%llX @0x%llX len=0x%llX%s  <- %s",
                              (unsigned)st, (unsigned long long)(ULONG_PTR)proc,
-                             (unsigned long long)(ULONG_PTR)addr, (unsigned long long)len, caller);
+                             (unsigned long long)(ULONG_PTR)addr, (unsigned long long)len,
+                             data, caller);
             EmitHook(msg);
         }
         inHook = 0;
@@ -2282,13 +2429,16 @@ static LONG WINAPI HkIatKbNtWvm(HANDLE proc, void* addr, const void* buf, SIZE_T
     LONG st = pIatNtWVM_(proc, addr, buf, len, got);
     if (!inHook && g_hooksActive && g_count < g_cap)
     {
-        WCHAR caller[300], msg[800];
+        WCHAR caller[300], msg[900], data[220];
+        data[0] = 0;
+        if (buf && len) BytesPreview(buf, len, data, 220, 16);   // the bytes being written
         inHook = 1;
         if (DescribeCaller(caller, 300))
         {
-            StringCchPrintfW(msg, 800, L"wvm    st=0x%08X proc=0x%llX @0x%llX len=0x%llX  <- %s",
+            StringCchPrintfW(msg, 900, L"wvm    st=0x%08X proc=0x%llX @0x%llX len=0x%llX%s  <- %s",
                              (unsigned)st, (unsigned long long)(ULONG_PTR)proc,
-                             (unsigned long long)(ULONG_PTR)addr, (unsigned long long)len, caller);
+                             (unsigned long long)(ULONG_PTR)addr, (unsigned long long)len,
+                             data, caller);
             EmitHook(msg);
         }
         inHook = 0;
@@ -3501,6 +3651,27 @@ static int HookOneModule(HMODULE mod, const WCHAR* modName)
                         if (f && HookIatByValue(mod, f, (void*)HkIatNtTerm, (void**)&pIatNtTerm_))
                         { WCHAR msg[300]; StringCchPrintfW(msg, 300, L"(iat) NtTerminateProcess hooked in %s", modName); HookNote(msg); hooked++; }
                     }
+                    // artifact imports these two straight from ntdll: the
+                    // KERNELBASE layer watches KERNELBASE's imports, so without
+                    // this the probe is invisible. NtQueryInformationThread is
+                    // anti-debug (ThreadHideFromDebugger et al), and
+                    // NtQueryVolumeInformationFile is fingerprinting.
+                    // By name first, so a module whose IAT is bound to a shadow
+                    // ntdll copy is still matched; by value for ordinal imports.
+                    hooked += HookIatApi(mod, "NtQueryInformationThread", (void*)HkIatModNtQit, (void**)&pModNtQIT_, modName);
+                    hooked += HookIatApi(mod, "NtQueryVolumeInformationFile", (void*)HkIatModNtQvif, (void**)&pModNtQvif_, modName);
+                    if (!pModNtQIT_)
+                    {
+                        void* f = (void*)GetProcAddress(nt, "NtQueryInformationThread");
+                        if (f && HookIatByValue(mod, f, (void*)HkIatModNtQit, (void**)&pModNtQIT_))
+                        { WCHAR msg[300]; StringCchPrintfW(msg, 300, L"(iat) NtQueryInformationThread (ordinal import) hooked in %s", modName); HookNote(msg); hooked++; }
+                    }
+                    if (!pModNtQvif_)
+                    {
+                        void* f = (void*)GetProcAddress(nt, "NtQueryVolumeInformationFile");
+                        if (f && HookIatByValue(mod, f, (void*)HkIatModNtQvif, (void**)&pModNtQvif_))
+                        { WCHAR msg[300]; StringCchPrintfW(msg, 300, L"(iat) NtQueryVolumeInformationFile (ordinal import) hooked in %s", modName); HookNote(msg); hooked++; }
+                    }
                 }
                 {
                     HMODULE adv = GetModuleHandleW(L"advapi32.dll");
@@ -4703,6 +4874,7 @@ static void ShadowSurvey(int first);
 static void LdrSurvey(int first);
 static void VehChainSurvey(int first);
 static void CpuTopologyInfo(void);
+static void CodeIntegrityInfo(void);
 static void DriversScan(int first);
 static void ServicesScan(int first);
 
@@ -4716,6 +4888,7 @@ static void RunMonitors(long long n)
         if (MemGuardScan) SafeCall(ScanGuardPages);
         if (WatchSharedData) SafeCall(WatchSharedDataTick);
         if (ScanDrivers) DriversScan(1);          // first: the hypervisor line
+        if (ScanDrivers) CodeIntegrityInfo();     // ...and the DSE state beside it
         if (ScanEh) { CpuTopologyInfo(); VehChainSurvey(1); }   // cross-references it
         if (ScanServices) ServicesScan(1);
     }
@@ -4728,7 +4901,7 @@ static void RunMonitors(long long n)
     if (ScanOtherHooks && HeartbeatSeconds > 0 && n % (HeartbeatSeconds * 4) == 0) SafeCall(ScanRescan);
     if (HeartbeatSeconds > 0 && n % (HeartbeatSeconds * 4) == 2)
     {
-        if (ScanDrivers) DriversScan(0);
+        if (ScanDrivers) { DriversScan(0); CodeIntegrityInfo(); }
         if (ScanEh) { CpuTopologyInfo(); VehChainSurvey(0); }  // re-probe + chain
         if (ScanServices) ServicesScan(0);
     }
@@ -5853,6 +6026,101 @@ static void CpuTopologyInfo(void)
     StringCchCopyW(g_hvLast, 128, state);
     Write(L"[SYS]", line);
     CsvRow(L"sys-cpu", hv ? (wh[0] ? wh : L"present") : L"none", line, L"");
+}
+
+// ---------------------------------------------------------------- code integrity
+// A helper that has to start an unsigned kernel driver (the protection
+// hypervisor) must first switch DSE - driver signature enforcement - off, and
+// switch it back on afterwards. That is not visible as a memory write we can
+// hook, but its *effect* is queryable from user mode:
+// NtQuerySystemInformation(SystemCodeIntegrityInformation, 103) returns the Code
+// Integrity options, bit 0 being CODEINTEGRITY_OPTION_ENABLED (a kernel driver
+// must be signed to load). Sampled at startup and on the same cadence as the
+// driver scan, so "enabled -> not enabled -> enabled" lands in the log with a
+// timestamp beside the SCM calls - the install is then provable even when the
+// write itself happens in a process we cannot instrument (services.exe) or in
+// kernel memory. Read-only: one query, no handle, no writes.
+typedef struct { ULONG Length; ULONG CodeIntegrityOptions; } GC_CIOPTS;
+
+static ULONG g_ciLast = 0xFFFFFFFFu;         // 0xFFFFFFFF = never sampled
+static int   g_ciUnsupported = 0;
+
+static void CiOptionsText(ULONG o, WCHAR* out, int cch)
+{
+    static const WCHAR* names[13] = {
+        L"enabled", L"test-signing", L"umci", L"umci-audit", L"umci-exclusions",
+        L"test-build", L"preproduction", L"debug-mode", L"flighting",
+        L"hvci-kmci", L"hvci-kmci-audit", L"hvci-kmci-strict", L"hvci-ium"
+    };
+    WCHAR tmp[240];
+    int i;
+    tmp[0] = 0;
+    for (i = 0; i < 13; i++)
+    {
+        if (!(o & (1u << i))) continue;
+        if (tmp[0]) StringCchCatW(tmp, 240, L" ");
+        StringCchCatW(tmp, 240, names[i]);
+    }
+    if (o >> 13)
+    {
+        WCHAR tail[60];
+        StringCchPrintfW(tail, 60, L"%sundecoded 0x%X", tmp[0] ? L" " : L"", o >> 13);
+        StringCchCatW(tmp, 240, tail);
+    }
+    if (!tmp[0]) StringCchCopyW(tmp, 240, L"none");
+    StringCchCopyW(out, (size_t)cch, tmp);
+}
+
+static void CodeIntegrityInfo(void)
+{
+    typedef LONG (WINAPI* t_NtQSIci)(ULONG, void*, ULONG, ULONG*);
+    t_NtQSIci q;
+    GC_CIOPTS ci;
+    ULONG ret = 0;
+    LONG st;
+    WCHAR names[240], line[700];
+    if (g_ciUnsupported) return;
+    q = (t_NtQSIci)(void*)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation");
+    if (!q) return;
+    memset(&ci, 0, sizeof(ci));
+    ci.Length = sizeof(ci);
+    st = (LONG)q(103 /* SystemCodeIntegrityInformation */, &ci, sizeof(ci), &ret);
+    if (st != 0 || ci.Length < sizeof(ci))
+    {
+        // say so once rather than silently reporting nothing forever
+        WCHAR note[400];
+        g_ciUnsupported = 1;
+        StringCchPrintfW(note, 400,
+            L"code integrity: NtQuerySystemInformation(SystemCodeIntegrityInformation) "
+            L"unsupported here (st=0x%08X, returned %lu) - DSE changes cannot be observed",
+            (unsigned)st, (unsigned long)ci.Length);
+        Write(L"[SYS]", note);
+        CsvRow(L"sys-ci", L"unsupported", note, L"");
+        return;
+    }
+    if (g_ciLast == ci.CodeIntegrityOptions) return;
+    CiOptionsText(ci.CodeIntegrityOptions, names, 240);
+    if (g_ciLast == 0xFFFFFFFFu)
+    {
+        StringCchPrintfW(line, 700, L"code integrity: options 0x%08X (%s) - %s",
+                         (unsigned)ci.CodeIntegrityOptions, names,
+                         (ci.CodeIntegrityOptions & 1)
+                             ? L"kernel-mode driver signing enforced (DSE on)"
+                             : L"kernel-mode driver signing NOT enforced (DSE already off)");
+    }
+    else
+    {
+        const WCHAR* what = L"";
+        if (!(g_ciLast & 1) && (ci.CodeIntegrityOptions & 1))
+            what = L" - DSE was turned back ON";
+        else if ((g_ciLast & 1) && !(ci.CodeIntegrityOptions & 1))
+            what = L" - DSE was turned OFF (an unsigned kernel driver can load now)";
+        StringCchPrintfW(line, 700, L"code integrity CHANGED 0x%08X -> 0x%08X (%s)%s",
+                         (unsigned)g_ciLast, (unsigned)ci.CodeIntegrityOptions, names, what);
+    }
+    g_ciLast = ci.CodeIntegrityOptions;
+    Write(L"[SYS]", line);
+    CsvRow(L"sys-ci", (ci.CodeIntegrityOptions & 1) ? L"dse-on" : L"dse-off", line, L"");
 }
 
 // ---------------------------------------------------------------- kernel modules

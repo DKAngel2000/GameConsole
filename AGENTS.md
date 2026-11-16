@@ -14,14 +14,19 @@ remote `origin`). Source-only: `*.dll`, `*.exe`, `*.obj`, `logs/`, `*.log`,
 `git ls-files --eol` should show `i/lf w/lf` for sources and docs, and
 `i/lf w/crlf` for `*.cmd`/`*.bat` (checkout conversion, by design — not drift).
 
-**Last behaviour-validated commit**: `aaa58ce` ("Log the hypervisor properly,
-fix the loaded-driver check, drop legion") — ScanTest green and all three games
-ran to a normal exit with it. ScanTest was re-run green at `69a499b` on
-2026-11-16 (Win11 x64, VS 2022 Build Tools) and again with the module-IAT
-registry bridge added on top of it (the commit after `e0b2ede`): exit=0, one
-`regkey`/`regset` each, no duplicates, 0 ESC bytes. The three-game half has
-**not** been re-run since `aaa58ce`. Update this
-line whenever you validate a change, so the next session knows what the last
+**Last behaviour-validated commit**: `0cabdee` for the three-game half — the
+deployed DLL in all three folders hashed identical to the repo build, and FFRS
+and PZ2 ran to a normal exit (FFRS's only WER entry is the known cosmetic
+`apphelp.dll` `0xC0000409`; PZ2 left none). PB0 did **not** run to a clean exit
+(see outstanding item 6). Before that, `aaa58ce` had all three games exit
+normally.
+
+ScanTest was re-run green on 2026-11-16 (Win11 x64, VS 2022 Build Tools) at
+`69a499b`, again with the module-IAT registry bridge on top of `e0b2ede`, and
+again with the code-integrity monitor, the direct-ntdll module probes
+(`qit`/`qvif`) and the returned-data previews: exit=0, one `regkey`/`regset`
+each, 8 FF25 sites, VEH chain 1→2, 0 ESC bytes, 0 unattributed callers. Update
+this line whenever you validate a change, so the next session knows what the last
 *proven* state was (`git log` is the tip; this line is about evidence, not
 recency).
 
@@ -71,32 +76,59 @@ by the script. Logs land in `<game>\logs\` (`.log` + `.csv`).
 1. **Capture the driver *install*** — not yet observed, because `hyperkd` was
    already installed and loaded before every session so far. To provoke it:
    stop the game, delete `HKLM\SYSTEM\CurrentControlSet\Services\artifact`,
-   reboot (to unload `hyperkd`), then run a title. Expected sequence:
-   `[KRNL] driver image written to disk` → `[HOOK] regkey … CREATED
-   "\REGISTRY\MACHINE\SYSTEM\…\Services\artifact"` → `[HOOK] regset …
-   ImagePath/Type/Start` → `[HOOK] svc create` / `svc start` → `[SVC] driver
-   service registered: …` → `is now LOADED` → `[KRNL] driver: hyperkd.sys`. Then
-   run `tools\RunReport.ps1 -Dir <game>\logs`: its "Driver / service install
+   reboot (to unload `hyperkd`), then run a title. What to expect, now that
+   artifact's imports have been dumped (`dumpbin /imports`):
+
+   * `[HOOK] svc openmgr` → `svc create` → `svc start` — artifact imports
+     `OpenSCManagerW`/`CreateServiceW`/`StartServiceW`/`OpenServiceW`/
+     `ControlService`/`DeleteService` from `advapi32`, so this is the one step we
+     are certain to see from inside the game.
+   * `[SYS] code integrity CHANGED … - DSE was turned OFF` → the `svc` lines →
+     `[SYS] code integrity CHANGED … - DSE was turned back ON`: the helper
+     (`dse.dll`, user-confirmed) has to disable driver signature enforcement to
+     start an untrusted hypervisor, then restore it. This pair is the proof that
+     the driver really was installed *by this session*.
+   * `[SVC] driver service registered: …` → `is now LOADED` → `[KRNL] driver:
+     hyperkd.sys`.
+
+   **Do not expect `regkey`/`regset` for the service key from the game.** A
+   service created through the SCM has its key written by `services.exe`, in
+   that process; artifact.dll imports no registry API at all (its 9 `advapi32`
+   imports are the SCM ones). The earlier expectation that the key write would
+   appear as `[HOOK] regkey … CREATED "\REGISTRY\MACHINE\SYSTEM\…"` was wrong.
+   `regkey`/`regset`/`syst` and the `[FS]` `.sys` classifier therefore still have
+   **no** in-game validation, and the module-IAT registry bridge is inert for
+   these three titles — keep it for modules that do import the registry pair, but
+   do not count on it for item 1.
+
+   Then run `tools\RunReport.ps1 -Dir <game>\logs`: its "Driver / service install
    trace" section states outright whether any of that was captured. Take the
-   run's `HKLM` service key **name** from the log, not from this note.
-   Until then `regkey`/`regset`/`svc`/`syst` and the `[FS]` `.sys` classifier
-   have **no** in-game validation. The registry half now has a better chance of
-   appearing: the module-IAT **registry bridge** (source map) hooks the same
-   calls inside artifact's own import table, so a shadow `KERNELBASE#1` route no
-   longer hides the key. Harness-validated, not yet game-validated.
-2. **Hidden-module PE-size fix is unvalidated in a game**: `ImageSizeAt` now
-   reports `SizeOfImage` instead of the first region (`dse.dll` showed `0x1000`)
-   but no hidden module appeared in the last runs to exercise it.
+   run's service key **name** from the log, not from this note.
+2. **Hidden-module PE-size fix — validated in a game** (PB0, 2026-11-16):
+   `hidden module: dse.dll @0x7FF9A81B0000 size 0x60000` and
+   `hidden module: nvldumdx.dll @0x7FF9A8580000 size 0xD1000`, real
+   `SizeOfImage` values rather than the old first-region `0x1000`. dse.dll is
+   listed in `load_dlls` next to gameconsole.dll, and the census walked its
+   imports (21, all `tally sums to 21`).
 3. **dse.dll detection is event-driven**: it is found only when caller
-   attribution catches it calling something we instrument. The last runs had no
-   `wvm` at all from it (earlier PB0 had 40 cross-process writes), so nothing was
-   reported. A session where the protection acts is needed.
+   attribution catches it calling something we instrument. The PB0 run on
+   2026-11-16 did finally report it (see item 2), but *after* the next heartbeat
+   would have been due, so `HookLateModules` never got to instrument it and the
+   process ended ~4 s later. A session where the protection acts (and survives)
+   is still what is needed to hook it and see its `wvm`/`svc` calls.
 4. Optional polish: the `[SCAN] ldr: <list> cycles after N distinct entries`
    lines repeat once per rescan (that is the list size changing, e.g. 88→150→
    193→194 on PB0). Dedupe to first-report-plus-change if it becomes noisy.
 5. Optional RE: name artifact's VEH handler for PZ2/FFRS. It is *not* in the OS
    chain (private list), so it needs a read-only hunt for the protection's own
    list — nothing yet.
+6. **PB0 ended without a crash report** (2026-11-16 12:38:12): no `[CRASH]`, no
+   `%TEMP%\GameConsole_crash.log`, and no WER `Application Error` entry at all,
+   with the log stopping mid-scan in the same second dse.dll was identified.
+   `EnableCrashHandler`/`WriteCrashFile` were on, so this was not an in-process
+   unhandled exception — the process was terminated. Re-run PB0 before drawing a
+   conclusion: if it dies at the same point again it is reproducible (and the
+   dse census is the suspect); if not, it was a one-off.
 
 ### How to read a run (quick recipe)
 
@@ -275,11 +307,13 @@ Verified 2026-11-16 at `69a499b` on Win11 Pro x64 with VS 2022 Build Tools
 | module ranges / shadow naming | `RefreshModuleRanges`, `CensusDescribe` (`NAME#k @base+off`) |
 | IAT hook layer | `HookIatApi`/`HookIatName`/`HookIatByValue`, every `HkIat*`, `InstallIatHooks`, `HookOneModule`, `HookLateModules`, `HookAddPending`/`IsPendingHook`/`HookClearPending`, `InstallKernelbaseInterposition` |
 | KERNELBASE interposition | **20** `Nt*`: file/memory/thread/context probing + `NtCreateKey`/`NtSetValueKey`/`NtSetSystemInformation`; handlers `HkIatKb*`, `RegPathOfKey` (NtQueryKey), `HkIatKbNtSsi` |
-| registry bridge (module IAT) | `HkIatModNtCreateKey`/`HkIatModNtSetValueKey`/`HkIatRegCreateKeyExW`/`HkIatRegSetValueExW` + the shared `RegLogKeyEvent`/`RegLogValueEvent` loggers, so a shadow `KERNELBASE#1` route still shows the driver's key; thread-local `t_regLogged` snapshot in the `Reg*` handlers keeps it to one line when the KERNELBASE layer has already reported the call |
+| registry bridge (module IAT) | `HkIatModNtCreateKey`/`HkIatModNtSetValueKey`/`HkIatRegCreateKeyExW`/`HkIatRegSetValueExW` + the shared `RegLogKeyEvent`/`RegLogValueEvent` loggers, so a module that imports the registry pair is covered even if it reaches a shadow `KERNELBASE#1`; thread-local `t_regLogged` snapshot in the `Reg*` handlers keeps it to one line when the KERNELBASE layer has already reported the call. **Inert for artifact.dll — it imports no registry API at all** (measured with `dumpbin /imports`), so a driver's service key is written by services.exe and cannot appear in the game's log |
+| direct-ntdll module probes | `HkIatModNtQit` / `HkIatModNtQvif` + `LogQit`, for the probes a module imports straight from ntdll (`NtQueryInformationThread`, `NtQueryVolumeInformationFile`) instead of through KERNELBASE |
+| returned data / written bytes | `BytesPreview` — bounded SEH-guarded hex of a caller buffer, used by `qip`/`qit` (what the OS answered), `qvmm` (decoded `MEMORY_BASIC_INFORMATION`), `rvm` (what was read out) and `wvm` (what was written in) |
 | census | `CensusBindings`, `CensusAllModules` |
 | surveys | `ScanNtdllHooks`(+`ScanNtdllImage`), `ShadowSurvey`/`DecodeExecPrologue`, `LdrSurvey`/`LdrWalkList` (per-list cycle detection) |
 | exception chain | `VehChainSurvey`, `VehFindLayout` (runtime layout + `RtlEncodePointer`), `VehHandlerOf`, `VehDescribe` |
-| system view | `CpuTopologyInfo` (CPUID + cross-reference, change-detected), `DriversScan` (`g_drvMatch`), `InstalledDriversScan` (`DrvIsLoaded` by image basename), `ServicesScan`, `WatchMatch`/`ServiceWatch` |
+| system view | `CpuTopologyInfo` (CPUID + cross-reference, change-detected), `CodeIntegrityInfo` (DSE state via `NtQuerySystemInformation` class 103, change-detected), `DriversScan` (`g_drvMatch`), `InstalledDriversScan` (`DrvIsLoaded` by image basename), `ServicesScan`, `WatchMatch`/`ServiceWatch` |
 | hidden modules | `ImageSizeAt` (PE `SizeOfImage`), `g_hiddenReported2` |
 | monitors | threads, exec memory, network, filesystem watchers (incl. the `.sys` classifier), heartbeat, guard pages, KUSER_SHARED_DATA mailbox |
 
@@ -300,10 +334,17 @@ Tags: `[INFO]` `[MOD]` `[THR]` `[MEM]` `[NET]` `[FS]` `[HB]` `[SD]` `[ODS]`
 `[<file.log>]`, plus `[raw]` for the game's own console output.
 
 Hook kinds on `[HOOK]` lines: `create/open/read/write/…` (file+memory),
-`qip/sit/sip/qit/setctx/getctx/cthex/avm/rvm/wvm/qvmm/openthr` (anti-debug and
-mutual probing), `veh add|remove`, `veh add continue`, `ueh set`, `regkey`
-(CREATED only), `regset`, `syst` (`NtSetSystemInformation`),
+`qip/sit/sip/qit/qvif/setctx/getctx/cthex/avm/rvm/wvm/qvmm/openthr` (anti-debug,
+fingerprinting and mutual probing), `veh add|remove`, `veh add continue`,
+`ueh set`, `regkey` (CREATED only), `regset`, `syst` (`NtSetSystemInformation`),
 `svc openmgr|create|start|delete`, `gpa`, `iat`.
+
+Data now appears on the probe lines, not just the call: `qip`/`qit` append the
+first 16 bytes the OS returned, `qvmm` decodes the returned
+`MEMORY_BASIC_INFORMATION` (`base/size/state/prot/type`), `rvm` shows the bytes
+read out and `wvm` the bytes written in. When adding a hook, prefer reporting the
+*returned/transferred data* for queries and writes — "what came back" and "what
+was patched" is the point of the tool, and a bare pointer is not evidence.
 
 ## Domain knowledge from real runs (observational)
 
@@ -332,10 +373,34 @@ mutual probing), `veh add|remove`, `veh add continue`, `ueh set`, `regkey`
   `ntdll#1!LdrGetDllHandle` and `RtlAddVectoredExceptionHandler` to itself (newer
   builds), and starts the driver through the SCM. `apphelp.dll` takes
   `Nt*File`/`ZwSetValueKey` forwards (AppCompat shim).
+  Its import surface was dumped for PB0 (1.28 MB image, 14 descriptors, 134
+  imports) — worth knowing before hooking anything:
+  * `advapi32` (9) is **the whole SCM path**: `OpenSCManagerW`, `CreateServiceW`,
+    `StartServiceW`, `OpenServiceW`, `ControlService`, `DeleteService`,
+    `CloseServiceHandle`, `OpenProcessToken`, `GetTokenInformation`.
+  * `ntdll` (8) is **probes only, no registry**: `NtQueryVolumeInformationFile`
+    (volume serial/label fingerprinting), `NtQueryInformationThread`,
+    `NtReadFile`, `NtOpenFile`, `NtTerminateProcess`, `RtlNtStatusToDosError`,
+    `RtlAddVectoredExceptionHandler`, plus one ordinal-bound entry.
+  * `kernel32` (87) includes `CreateToolhelp32Snapshot` + `Thread32First/Next`
+    (thread enumeration), `OpenThread`, `GetThreadContext`/`SetThreadContext`,
+    `CopyFileExW`, `QueryDosDeviceW`, `GetFinalPathNameByHandleW`,
+    `SetFileInformationByHandle`, `GetModuleHandleExW`, `CreateProcessW`,
+    `ExitProcess`, `TerminateProcess`.
+  * **No `Reg*` and no `Nt*Key` at all** — that is why the registry bridge is
+    inert here, and why a service key write cannot come from the game process.
 * **`dse.dll`** is a hidden helper: in no toolhelp list and no PEB loader list,
   resolvable only by address; it does cross-process `NtWriteVirtualMemory` (2
   writes per target into ~20 processes). Detection is **event-driven** — it shows
   up only when it calls something we instrument.
+  Its job (user-confirmed, and consistent with its imports): **switch DSE off**
+  so the unsigned `hyperkd.sys` can start, wait for the hypervisor service, then
+  **switch DSE back on**. It imports only 21 functions — `advapi32!FreeSid`,
+  `Cabinet!FDICopy`, `dbghelp!SymFromNameW`, `KERNEL32!LoadLibraryA`/
+  `GetProcAddress`/`VirtualProtect`, the rest CRT — i.e. a self-unpacking stub
+  that resolves every ntdll call at run time. That is why hooking its IAT by name
+  finds nothing useful, and why the **Code Integrity state** is the reliable
+  observable of its work.
 * **Hypervisor**: `hyperkd.sys` in `<game>\Artifact_Intel\`, registered under
   service key `artifact` (PZ2), so compare a service's **ImagePath basename**
   with loaded modules, never the key name. Plus Microsoft's `hvservice.sys`.

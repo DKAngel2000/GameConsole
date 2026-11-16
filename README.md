@@ -179,7 +179,7 @@ repo overrides four of them: `HoldOnCrash=false`, `HookModules=artifact.dll,dse.
 | `ScanLdr` | `true` | Walk the PEB loader list read-only; report modules toolhelp32 does not show and entries pointing at non-`MEM_IMAGE` memory |
 | `ScanEh` | `true` | Report the real VEH chain (who registered which handler, in what order) and log later VEH/UEH registrations |
 | `ScanServices` | `true` | Enumerate Windows services read-only; report `ServiceWatch` matches and new ones that appear while the game runs |
-| `ScanDrivers` | `true` | Enumerate loaded kernel drivers read-only; report `ServiceWatch` matches — the kernel/hypervisor component a protection service installs |
+| `ScanDrivers` | `true` | Enumerate loaded kernel drivers read-only; report `ServiceWatch` matches - the kernel/hypervisor component a protection service installs. Also samples the Code Integrity options, so driver-signature enforcement being switched off and back on is reported |
 | `ServiceWatch` | *(vendor list)* | Comma-separated words matched case-insensitively against service names, display names, binary paths, kernel driver paths and the CPUID hypervisor vendor |
 | `ServiceWatchAll` | `false` | Also list EVERY running service / loaded kernel driver, not just `ServiceWatch` matches (noisy) |
 | `WatchSharedData` | `true` | Watch the last bytes of KUSER_SHARED_DATA (`0x7FFE0FE0..0x1000`) for changes |
@@ -263,7 +263,6 @@ Two modes, selected by `HookModules`:
   `VirtualQueryEx` and `ReadProcessMemory`, so its own memory-walking shows as
   `vquery` / `vqueryex` / `readproc` lines (address, resulting region, caller),
   plus the exception-handler registration APIs:
-
   | line | API | meaning |
   |---|---|---|
   | `veh add first\|last` | `AddVectoredExceptionHandler` / `RtlAddVectoredExceptionHandler` | a handler was registered; the **handler's module+offset** and the caller are printed |
@@ -273,6 +272,24 @@ Two modes, selected by `HookModules`:
   | `regkey CREATED` | `NtCreateKey` | a registry key was **created** (not just opened) — who installed this |
   | `regset` | `NtSetValueKey` | a registry value was written: key path (resolved with `NtQueryKey`), value name, type, size and data |
   | `syst` | `NtSetSystemInformation` | a system-wide information *write* (rare): class, length and the first dword of the payload |
+
+  Two ntdll probes that a protection imports **directly** (so the KERNELBASE
+  layer never sees them, because it watches KERNELBASE's own imports) are hooked
+  in the module's import table as well:
+
+  | line | API | what it reveals |
+  |---|---|---|
+  | `qit class=N` | `NtQueryInformationThread` | thread-info reads — start address, hide-from-debugger read-back |
+  | `qvif class=N serial=… dev=… fs="…"` | `NtQueryVolumeInformationFile` | **hardware fingerprinting**: volume serial number and creation time, device type/characteristics, file-system name |
+
+  Several probe lines now carry the **data**, not just the call: `qip`/`qit`
+  append the first 16 bytes the OS returned, `qvmm` decodes the
+  `MEMORY_BASIC_INFORMATION` it got back (`base/size/state/prot/type` — private
+  versus image, committed versus free, executable or not, which is how a
+  protection tells its own manual-mapped copy from a real module), `rvm` shows
+  what was read out of the target process and `wvm` shows the bytes being
+  written into it. That is the "what came back / what was patched" half of the
+  trace; the caller is on every line.
 
   The registry pair is how a service or a **kernel driver is registered**
   (`ImagePath`, `Type`, `Start`), so a driver install reads:
@@ -289,6 +306,16 @@ Two modes, selected by `HookModules`:
   both, only one line is printed (the module-side handler notices that the
   layer already reported it); when it only passes through the shadow copy, the
   module-side hook still records it.
+
+  Be clear about what that can and cannot prove. Dumping artifact.dll's imports
+  shows **no registry API at all** — its `advapi32` imports are the service
+  control manager (`CreateServiceW`, `StartServiceW`, `OpenSCManagerW`,
+  `OpenServiceW`, `ControlService`, `DeleteService`) and its `ntdll` imports are
+  seven probes, not the registry pair. A service created through the SCM has its
+  key written by **services.exe**, in that process, so `regkey`/`regset` for a
+  driver install may never appear in the game's own log. The install is proven
+  instead by `svc create`/`svc openmgr`/`svc start`, by the driver appearing in
+  `[KRNL]`/`[SVC]`, and by the code-integrity transition below.
 
 - **Hook targets that load later** (`HookModules`/`HookExe`). artifact/dse load
   *after* this DLL, so a name that cannot be resolved at startup is not dropped:
@@ -536,6 +563,28 @@ an emu do *to each other*:
   by this protection (they are absent from artifact.dll, dse.dll and
   KERNELBASE), so the load goes through the service control manager and appears
   above — and, when dse.dll is instrumented, as its own `svc start` line.
+
+  Because the protection hypervisor is not signed by a trusted publisher, the
+  helper (`dse.dll`) has to **switch driver signature enforcement off**, let the
+  service start, then switch it back on. That is the one step that leaves no
+  user-mode call to hook, but its *effect* is readable: Windows exposes the Code
+  Integrity options through
+  `NtQuerySystemInformation(SystemCodeIntegrityInformation)`, and bit 0 of that
+  value is `CODEINTEGRITY_OPTION_ENABLED` (a kernel driver must be signed). It is
+  sampled at startup and on the driver-scan cadence, change-detected, and logged
+  with decoded flags:
+
+  ```
+  [SYS] code integrity: options 0x0000C001 (enabled undecoded 0x6) - kernel-mode driver signing enforced (DSE on)
+  [SYS] code integrity CHANGED 0x0000C001 -> 0x0000C000 (undecoded 0x6) - DSE was turned OFF (an unsigned kernel driver can load now)
+  [SYS] code integrity CHANGED 0x0000C000 -> 0x0000C001 (enabled undecoded 0x6) - DSE was turned back ON
+  ```
+
+  An `enabled → off → enabled` pair around a `svc create`/`svc start` is the
+  install observed end to end, and it is read-only (one query, no handles, no
+  writes). Bits Windows does not document are printed as `undecoded 0x…` rather
+  than guessed at, and a build where the query is refused says so once instead of
+  staying silent.
 
 - **CSV export** (`CsvExport`). A machine-readable `GameConsole_pid<pid>.csv`
   is written next to the log with one quoted row per census summary,
