@@ -73,7 +73,10 @@ by the script. Logs land in `<game>\logs\` (`.log` + `.csv`).
    `[KRNL] driver image written to disk` → `[HOOK] regkey … CREATED
    "\REGISTRY\MACHINE\SYSTEM\…\Services\artifact"` → `[HOOK] regset …
    ImagePath/Type/Start` → `[HOOK] svc create` / `svc start` → `[SVC] driver
-   service registered: …` → `is now LOADED` → `[KRNL] driver: hyperkd.sys`.
+   service registered: …` → `is now LOADED` → `[KRNL] driver: hyperkd.sys`. Then
+   run `tools\RunReport.ps1 -Dir <game>\logs`: its "Driver / service install
+   trace" section states outright whether any of that was captured. Take the
+   run's `HKLM` service key **name** from the log, not from this note.
    Until then `regkey`/`regset`/`svc`/`syst` and the `[FS]` `.sys` classifier
    have **no** in-game validation.
 2. **Hidden-module PE-size fix is unvalidated in a game**: `ImageSizeAt` now
@@ -91,6 +94,22 @@ by the script. Logs land in `<game>\logs\` (`.log` + `.csv`).
    list — nothing yet.
 
 ### How to read a run (quick recipe)
+
+Use the script; it is this recipe, kept in one place:
+
+```powershell
+.\tools\RunReport.ps1                          # newest log under .\logs
+.\tools\RunReport.ps1 -Dir <game>\logs         # newest log in a game folder
+.\tools\RunReport.ps1 -Log a.log,b.log         # compare sessions side by side
+.\tools\RunReport.ps1 -Log x.log -Full         # also dump the matching lines
+```
+
+It prints: ESC/unattributed-caller integrity, the hook surface (which modules and
+which hook kinds), the **driver/service install trace with a verdict** (item 1),
+loader-list cycles/ghosts, hidden modules, the VEH chain, `[SYS]/[KRNL]/[SVC]`,
+anti-debug probes, and census tallies. Read-only.
+
+By hand, the same queries:
 
 ```powershell
 $c = Get-Content <log>
@@ -159,6 +178,7 @@ game-specific code, so the same build can be pointed at another title.
 build.cmd                          # finds VS via vswhere, cl /LD /O2 /W3 -> GameConsole.dll
 deploy.cmd                         # copies the DLL into a game folder (edit GAME= at the top)
 tools\ScanTest.c                   # the regression harness (below)
+tools\RunReport.ps1 [log]          # summarise/compare a run log (the recipe, scripted)
 tools\SingleHost.c                 # single-DLL host: LoadLibrary + hammered APIs + ODS + first-chance exception
 tools\peimports.ps1 <pe-file>      # raw PE import dump: proves the binding census is complete
 tools\symlookup.c                  # resolve <image>+<hex-offset> through the image's PDB (dbghelp)

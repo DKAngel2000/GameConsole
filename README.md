@@ -207,6 +207,10 @@ process that looks hung.
   `[raw]` lines in order.
 - `%TEMP%\GameConsole.log` — startup trace (handy when something fails to start).
 - `%TEMP%\GameConsole_crash.log` — crash reports.
+- Reading a run: `tools\RunReport.ps1` turns a log into a summary — hook surface,
+  the driver/service install trace, loader-list tampering, hidden modules, the
+  VEH chain, kernel/service matches and the census tallies. Pass several logs to
+  compare sessions, or `-Full` for the matching lines.
 
 ## Hooks — what the mod actually does
 
