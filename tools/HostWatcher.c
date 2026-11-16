@@ -99,6 +99,10 @@ static PROCENT g_procs[MAXPROCS];
 static int    g_nProcs;
 static int    g_procBaselineDone;
 
+typedef struct { WCHAR name[MAXNAME]; int shown; int suppressed; } NAMECOUNT;
+static NAMECOUNT g_nameCounts[64];
+static int       g_nNameCounts;
+
 static ULONG  g_ci = 0xFFFFFFFFu;
 static int    g_ciUnavailable;
 static FILE*  g_out;
@@ -390,6 +394,43 @@ static int IsElevated(DWORD pid)
     return r;
 }
 
+// Command line of a running process. NtQueryInformationProcess class 60
+// (ProcessCommandLineInformation) needs only PROCESS_QUERY_LIMITED_INFORMATION,
+// so a same-user elevated process can usually still be read from here - worth it,
+// because `rundll32.exe <dll>,<entry>` and `dse_elevator.exe <args>` say exactly
+// what the protection's helpers are, and the exe name alone does not.
+typedef LONG (NTAPI* t_NtQIP)(HANDLE, ULONG, void*, ULONG, ULONG*);
+
+static void ProcessCommandLine(HANDLE p, WCHAR* out, size_t cch)
+{
+    static t_NtQIP qip;
+    // the class returns {USHORT Length; USHORT MaximumLength; WCHAR* Buffer;}
+    BYTE buf[2048];
+    ULONG got = 0;
+    USHORT len;
+    WCHAR* str;
+    out[0] = 0;
+    if (!qip)
+        qip = (t_NtQIP)(void*)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess");
+    if (!qip) return;
+    if (qip(p, 60 /* ProcessCommandLineInformation */, buf, sizeof(buf), &got) != 0) return;
+    len = *(USHORT*)buf;
+    str = *(WCHAR**)(buf + 8);
+    if (!str || !len) return;
+    __try { wcsncpy_s(out, cch, str, len / sizeof(WCHAR)); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; }
+}
+
+static void ProcessImage(DWORD pid, WCHAR* out, size_t cch)
+{
+    HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    DWORD n = (DWORD)cch;
+    out[0] = 0;
+    if (!p) return;
+    if (!QueryFullProcessImageNameW(p, 0, out, &n)) out[0] = 0;
+    CloseHandle(p);
+}
+
 static void PollProcesses(void)
 {
     HANDLE snap;
@@ -426,12 +467,43 @@ static void PollProcesses(void)
                 if (g_procs[j].pid == fresh[i].pid) found = 1;
             if (!found)
             {
-                _snwprintf_s(line, _countof(line), _TRUNCATE,
-                             L"PROC    + %-28s pid %-6u parent %-6u %s",
-                             fresh[i].name, fresh[i].pid, fresh[i].ppid,
-                             fresh[i].elevated == 1 ? L"ELEVATED" :
-                             fresh[i].elevated == 0 ? L"not elevated" : L"(elevation unknown)");
-                Emit(line);
+                // A game that spawns forty copies of the same helper would drown
+                // the timeline, so each name gets a handful of full lines and the
+                // rest are counted and summarised at the end.
+                int idx = -1, k;
+                for (k = 0; k < g_nNameCounts; k++)
+                    if (!_wcsicmp(g_nameCounts[k].name, fresh[i].name)) { idx = k; break; }
+                if (idx < 0 && g_nNameCounts < 64)
+                {
+                    idx = g_nNameCounts++;
+                    wcsncpy_s(g_nameCounts[idx].name, MAXNAME, fresh[i].name, _TRUNCATE);
+                }
+                if (idx >= 0 && g_nameCounts[idx].shown >= 6)
+                {
+                    g_nameCounts[idx].suppressed++;
+                }
+                else
+                {
+                    WCHAR img[MAXPATH_], cmd[900];
+                    HANDLE p;
+                    if (idx >= 0) g_nameCounts[idx].shown++;
+                    img[0] = cmd[0] = 0;
+                    p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, fresh[i].pid);
+                    if (p)
+                    {
+                        ProcessCommandLine(p, cmd, _countof(cmd));
+                        CloseHandle(p);
+                    }
+                    if (!cmd[0]) ProcessImage(fresh[i].pid, img, _countof(img));
+                    _snwprintf_s(line, _countof(line), _TRUNCATE,
+                                 L"PROC    + %-24s pid %-6u parent %-6u %s%s%s",
+                                 fresh[i].name, fresh[i].pid, fresh[i].ppid,
+                                 fresh[i].elevated == 1 ? L"ELEVATED" :
+                                 fresh[i].elevated == 0 ? L"not elevated" : L"(elevation unknown)",
+                                 cmd[0] ? L"  cmd=" : (img[0] ? L"  exe=" : L""),
+                                 cmd[0] ? cmd : img);
+                    Emit(line);
+                }
             }
         }
         for (j = 0; j < g_nProcs; j++)
@@ -555,10 +627,27 @@ int wmain(int argc, wchar_t** argv)
         // short); the module list and the service table on every tenth poll,
         // because enumerating them is the expensive part of the loop.
         PollCi();
-        if (n++ % 10 == 0) { PollModules(); PollServices(extra); PollProcesses(); }
+        // processes at 4x the module/service rate: a helper like dse_elevator lives
+        // for seconds, but a rundll32 one-shot can come and go inside one 500 ms
+        // window, and those are exactly the ones worth naming
+        if (n % 4 == 0) PollProcesses();
+        if (n++ % 10 == 0) { PollModules(); PollServices(extra); }
         Sleep((DWORD)pollMs);
     }
 
+    {
+        int k;
+        for (k = 0; k < g_nNameCounts; k++)
+        {
+            if (g_nameCounts[k].suppressed)
+            {
+                _snwprintf_s(line, _countof(line), _TRUNCATE,
+                             L"PROC    %s: %d more creation(s) not listed (first %d shown)",
+                             g_nameCounts[k].name, g_nameCounts[k].suppressed, g_nameCounts[k].shown);
+                Emit(line);
+            }
+        }
+    }
     Emit(L"HostWatcher: stopped");
     if (g_out) fclose(g_out);
     return 0;
