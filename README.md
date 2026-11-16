@@ -34,12 +34,162 @@ real work, so nothing is done under the loader lock. There is no exported `Init`
 
 `GameConsole.ini` next to the DLL. Created from defaults if missing; **missing keys are
 appended** to your existing file automatically on startup. Edit and restart the game.
+The defaults below are the `Opts[]` table in `GameConsole.c`; the ini shipped in the
+repo overrides four of them: `HoldOnCrash=false`, `HookModules=artifact.dll,dse.dll`,
+`MaxHookReports=10000`, `CensusAllMax=1000`.
 
-Main switches: `ConsoleVisible`/`AllocConsole` (console or log-file-only), `SaveLogFile`,
-`LogDirectory`, `Show_*` (hide a category from console **and** file), `Capture*`/`Redirect*`,
-`Mon*` (each monitor), `Tail*` (log tailing), `Hook*` (hook layer), `MaxHookReports`,
-`CensusAll`/`CensusAllMax`, `GpaThunks`, `ScanShadow`/`ShadowDetailMax`,
-`ScanLdr`, `WatchSharedData`, `MemGuardScan`/`MemGuardAll`, `CsvExport`.
+### Console window
+
+| switch | default | meaning |
+|---|---|---|
+| `ConsoleVisible` | `true` | Show the console window. `false` = hidden (the saved log file keeps working) |
+| `AllocConsole` | `true` | `false` = no console at all (log-file-only mode); diagnostic for compat-shim conflicts |
+| `ConsoleTitle` | `Game Debug Console` | Title of the console window |
+| `ConsoleCols` | `300` | Console buffer width, 80-1000; wide = long lines do not wrap in the saved log |
+| `ConsoleRows` | `20000` | Console buffer height, 200-30000; when nearly full it is wiped after saving |
+| `ShowTimestamps` | `true` | Prefix tagged lines with `HH:mm:ss.fff` |
+| `ShowColors` | `true` | Colour the tags (ANSI codes) |
+| `ShowLegend` | `true` | Print the tag legend at startup |
+| `ShowStartupInfo` | `true` | Print exe path, command line, working directory and OS at startup |
+| `HoldOnCrash` | `true` | On an unhandled crash, freeze the process so the console stays readable. The shipped ini sets `false`: a held process looks exactly like a hang |
+
+### Saving
+
+| switch | default | meaning |
+|---|---|---|
+| `SaveLogFile` | `true` | Save the console to a file |
+| `LogDirectory` | *(empty)* | Folder for saved logs; empty = a `logs` folder next to `GameConsole.dll` |
+| `SaveTaggedLines` | `true` | Save lines written by GameConsole (the ones with a `[tag]`) |
+| `SaveRawLines` | `true` | Save lines written straight to the console by the game or mods (marked `[raw]`) |
+| `WriteTraceFile` | `true` | Write `GameConsole.log` in `%TEMP%` (startup steps, handy if something fails to start) |
+| `WriteCrashFile` | `true` | Write `GameConsole_crash.log` in `%TEMP%` (crash reports) |
+| `CsvExport` | `true` | Write a machine-readable `GameConsole_<pid>.csv` next to the log (census/survey/hook/mailbox rows) |
+
+### Capture (listen or redirect output only, nothing is patched)
+
+| switch | default | meaning |
+|---|---|---|
+| `CaptureOutputDebugString` | `true` | Listen for `OutputDebugString` calls |
+| `RedirectCrt` | `true` | Point the game's `printf`/stdout/stderr (UCRT) at the console |
+| `RedirectStdHandles` | `true` | Point the process standard handles at the console (Win32 writes to stdout/stderr) |
+| `EnableCrashHandler` | `true` | Install an unhandled-exception filter that logs the final crash |
+
+### Categories (`false` hides the category from the console **and** the saved file)
+
+| switch | default | tags |
+|---|---|---|
+| `Show_ODS` | `true` | `[ODS]` OutputDebugString text |
+| `Show_LogFiles` | `true` | `[<file.log>]` tailed log files, **and** `[SCAN]` — `CategoryOn` falls through to this gate for any tag without its own switch |
+| `Show_Modules` | `true` | `[MOD]` DLL load/unload |
+| `Show_Crash` | `true` | `[CRASH]` access violations, stack overflows and similar |
+| `Show_Exceptions` | `true` | `[EXC]` other exceptions (also gates `[EH]`) |
+| `Show_Threads` | `true` | `[THR]` threads |
+| `Show_Memory` | `true` | `[MEM]` new executable memory |
+| `Show_Network` | `true` | `[NET]` TCP connections |
+| `Show_FileSystem` | `true` | `[FS]` files created/deleted/renamed |
+| `Show_Heartbeat` | `true` | `[HB]` periodic counts |
+| `Show_SharedData` | `true` | `[SD]` KUSER_SHARED_DATA changes (the Dr-armed mailbox) |
+| `Show_System` | `true` | `[SYS]`/`[KRNL]`/`[SVC]` hypervisor, kernel modules and services |
+| `Show_Info` | `true` | `[INFO]` startup information |
+| `Show_Console` | `true` | `[console]` GameConsole's own status messages |
+| `Show_Hooks` | `true` | `[HOOK]` hooked Nt* API activity (file reads/writes, memory-protection changes) |
+
+### OutputDebugString, log files
+
+| switch | default | meaning |
+|---|---|---|
+| `OdsShowCaller` | `true` | Name the module that called `OutputDebugString` in the tag |
+| `TailLogFiles` | `true` | Follow `*.log` files in the game folder while the game runs |
+| `TailUnityPlayerLog` | `true` | Also follow Unity `Player.log` under AppData LocalLow |
+| `TailTxtFilesWithLogInName` | `true` | Also follow `.txt` files with `log` in the name |
+| `TailSkipExistingContent` | `false` | `true` = only show lines added after the file was first seen |
+| `LogScanDepth` | `3` | How many subfolder levels under the game folder to search (0-10) |
+
+### Modules
+
+| switch | default | meaning |
+|---|---|---|
+| `ModulesPresent` | `true` | List the modules already loaded at startup |
+| `ModulesLoaded` | `true` | Log DLLs as they load |
+| `ModulesUnloaded` | `true` | Log DLLs as they unload |
+| `ModulesHideSystem` | `false` | Hide DLLs from the Windows folder (shows only game and mod DLLs) |
+| `ModulesShowPath` | `true` | Show the full path of each present module |
+
+### Exceptions
+
+| switch | default | meaning |
+|---|---|---|
+| `LogAllExceptions` | `true` | Log non-crash exceptions (C++ throws, breakpoints and so on) |
+| `ExceptionCrashCodes` | `true` | Log access violations and similar when they are thrown (first chance) |
+| `ExceptionStackTrace` | `true` | Include a stack trace in crash reports |
+| `ExceptionCpp` | `true` | Include C++ throws |
+| `ExceptionClr` | `true` | Include .NET CLR exceptions |
+| `ExceptionBreakpoints` | `true` | Include breakpoints and single-steps |
+| `ExceptionOther` | `true` | Include any other exception code |
+| `MaxCrashReports` | `25` | Cap on first-chance crash-code reports (some are harmless) |
+| `MaxOtherExceptions` | `500` | Cap on other exception reports |
+
+### Threads, memory, network, files, heartbeat
+
+| switch | default | meaning |
+|---|---|---|
+| `MonThreads` | `true` | Watch threads |
+| `ThreadsPresent` | `true` | List threads that already exist at startup |
+| `ThreadsStarted` | `true` | Log new threads with their start module |
+| `ThreadsExited` | `true` | Log threads that exit |
+| `MonMemory` | `true` | Watch for executable memory not owned by any DLL or EXE |
+| `MemoryBaseline` | `true` | Print how many such regions exist at startup |
+| `MonNetwork` | `true` | Watch this process's IPv4 TCP connections |
+| `NetNew` | `true` | Log new connections |
+| `NetChanges` | `true` | Log connection state changes |
+| `NetClosed` | `true` | Log connections that close |
+| `MonGameFolder` | `true` | Watch the game folder (recursive) for created/deleted/renamed files |
+| `MonTempDir` | `true` | Watch the `%TEMP%` folder too |
+| `FsCreated` | `true` | Log created files and folders |
+| `FsDeleted` | `true` | Log deleted files and folders |
+| `FsRenamed` | `true` | Log renamed files and folders |
+| `MonHeartbeat` | `true` | Print thread/handle/memory counts periodically |
+| `HeartbeatSeconds` | `10` | Seconds between heartbeats (1-3600); the heartbeat drives the periodic rescans and monitors |
+
+### Hooks (opt-in: patches ntdll `Nt*` exports in-process to log them)
+
+| switch | default | meaning |
+|---|---|---|
+| `HookApis` | `true` | Install lightweight ntdll hooks; `false` = the old purely passive design |
+| `HookFileReads` | `true` | Log `NtReadFile` calls (file reads) |
+| `HookFileWrites` | `true` | Log `NtCreateFile`/`NtOpenFile`/`NtWriteFile` calls |
+| `HookMemPatches` | `true` | Log `NtProtectVirtualMemory` calls when execute rights are involved (code patching) |
+| `HookOnlyGameModules` | `true` | `true` = skip callers inside the Windows folder (game/mod DLLs only) |
+| `HookLegacyNtdll` | `false` | Also allow legacy ntdll stub patching when `HookModules` is empty. **Dangerous**: races other mods' ntdll hooks |
+| `HookModules` | *(empty)* | Comma-separated module names whose IAT is instrumented, e.g. `artifact.dll`. Empty = no per-module IAT hooks, but the KERNELBASE interposition layer is still installed and logs all callers |
+| `HookExe` | `false` | Also instrument the game executable's own import table. OFF by default: a protected exe checks its own imports, and repointing them can fail its tamper check (`Corrupt pak index detected`) |
+| `MaxHookReports` | `2000` | Cap on hook log lines so a chatty caller cannot flood the console |
+| `GpaThunks` | `true` | `GetProcAddress` calls through `HookModules`' import table are logged AND return a logging thunk (counts + last caller, reported each heartbeat). `false` if a game verifies the returned pointer |
+
+### Read-only surveys
+
+| switch | default | meaning |
+|---|---|---|
+| `ScanOtherHooks` | `true` | Report every ntdll export whose entry is a jump instead of a clean syscall stub (hooked by another module / alias / non-export cave). Runs at startup and each heartbeat (new sites only) |
+| `ScanOtherHooksMax` | `400` | Max `[SCAN]` detail lines per image per survey |
+| `ShadowDetailMax` | `24` | Shadow-DLL survey: max export-redirect detail lines per shadow module (per-module summary is always written) |
+| `CensusAll` | `true` | Binding census of every loaded module's import table; details imports not bound to loader-loaded images (Denuvo-style manual-mapped copies). Startup and late-loading modules |
+| `CensusAllMax` | `300` | Cap on detail lines from the all-module census |
+| `ScanShadow` | `true` | Survey manually-mapped shadow DLLs' exports (trampolines into the protected image?) plus a prologue decode of executable non-image regions |
+| `ScanLdr` | `true` | Walk the PEB loader list read-only; report modules toolhelp32 does not show and entries pointing at non-`MEM_IMAGE` memory |
+| `ScanEh` | `true` | Report the real VEH chain (who registered which handler, in what order) and log later VEH/UEH registrations |
+| `ScanServices` | `true` | Enumerate Windows services read-only; report `ServiceWatch` matches and new ones that appear while the game runs |
+| `ScanDrivers` | `true` | Enumerate loaded kernel drivers read-only; report `ServiceWatch` matches — the kernel/hypervisor component a protection service installs |
+| `ServiceWatch` | *(vendor list)* | Comma-separated words matched case-insensitively against service names, display names, binary paths, kernel driver paths and the CPUID hypervisor vendor |
+| `ServiceWatchAll` | `false` | Also list EVERY running service / loaded kernel driver, not just `ServiceWatch` matches (noisy) |
+| `WatchSharedData` | `true` | Watch the last bytes of KUSER_SHARED_DATA (`0x7FFE0FE0..0x1000`) for changes |
+| `MemGuardScan` | `true` | Report committed non-image pages carrying `PAGE_GUARD` or `PAGE_NOACCESS` (anti-debug tripwires) |
+| `MemGuardAll` | `false` | Also list low-address (thread-stack/heap) guard pages — usually noise; the protection's tripwires in the high module range are always listed |
+
+Missing keys are appended to an existing file with these defaults on startup;
+unknown keys stay in the file and are ignored. `HoldOnCrash=true` is the one to
+watch when copying an ini between machines: it turns an unhandled crash into a
+process that looks hung.
 
 ## Output
 

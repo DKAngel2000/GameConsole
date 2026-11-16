@@ -11,13 +11,15 @@ remote `origin`). Source-only: `*.dll`, `*.exe`, `*.obj`, `logs/`, `*.log`,
 `*.csv` are gitignored, so the built DLL is *not* in the repo — run `build.cmd`.
 `.gitattributes` pins LF for text (`*.c/*.h/*.md/*.ini/*.ps1`, CRLF for
 `*.cmd/*.bat`, binary for build outputs); `core.autocrlf=true` is set, so
-`git ls-files --eol` should show `i/lf w/lf`.
+`git ls-files --eol` should show `i/lf w/lf` for sources and docs, and
+`i/lf w/crlf` for `*.cmd`/`*.bat` (checkout conversion, by design — not drift).
 
 **Last behaviour-validated commit**: `aaa58ce` ("Log the hypervisor properly,
 fix the loaded-driver check, drop legion") — ScanTest green and all three games
-ran to a normal exit with it. Update this line whenever you validate a change,
-so the next session knows what the last *proven* state was (`git log` is the tip;
-this line is about evidence, not recency).
+ran to a normal exit with it. `81a1dbe` on top of it only rewrites `AGENTS.md`,
+so the tip has the same behaviour as the validated commit. Update this line
+whenever you validate a change, so the next session knows what the last *proven*
+state was (`git log` is the tip; this line is about evidence, not recency).
 
 **Tooling on the old box (Windows 11, x64)**: MSVC via `vswhere` (no VS project
 files), `git` with the Windows credential manager stored credential for GitHub.
@@ -25,7 +27,10 @@ There is **no `gh` CLI**, so PRs/issues/releases are not scripted here. Pushing
 works with `git push origin main` (set `GIT_TERMINAL_PROMPT=0` so it fails fast
 instead of blocking on a prompt). Shell note: the agent shell cannot parse
 `<<'EOF'` heredocs — write commit messages to a temp file and use
-`git commit -F <file>`.
+`git commit -F <file>`. Before assuming you can build, check for `vswhere`:
+a machine without the VS C++ tools installed cannot run `build.cmd` or the
+harness, and the repo carries no binaries, so validation has to happen on a box
+with MSVC (or after installing the Build Tools).
 
 ### Deployed state (old machine; paths are per-machine, configs are portable)
 
@@ -152,16 +157,29 @@ game-specific code, so the same build can be pointed at another title.
 build.cmd                          # finds VS via vswhere, cl /LD /O2 /W3 -> GameConsole.dll
 deploy.cmd                         # copies the DLL into a game folder (edit GAME= at the top)
 tools\ScanTest.c                   # the regression harness (below)
+tools\SingleHost.c                 # single-DLL host: LoadLibrary + hammered APIs + ODS + first-chance exception
 tools\peimports.ps1 <pe-file>      # raw PE import dump: proves the binding census is complete
+tools\symlookup.c                  # resolve <image>+<hex-offset> through the image's PDB (dbghelp)
 tools\VehProbe.c                   # how the Win11 VEH node layout/encoding was established
 tools\SysInfoProbe.c               # swept NtQuerySystemInformation classes 0x00-0x120 (see quirks)
 ```
 
+`tools\CrashProbe.c`, `tools\StressTest.c` and `tools\TestHost.c` are **legacy**
+from the pre-single-DLL layout: they load `Bootstrap.dll`/`GameHooks.dll`, which
+no longer exist, so they will not exercise the current DLL. Keep them only as
+history; use `SingleHost.c`/`ScanTest.c` instead. (`SingleHost.c` needs
+`GameConsole.dll` in its own folder; the ini is created from defaults if absent.)
+
 ### Regression harness
 
-Build `tools\ScanTest.c` to `%TEMP%\scantest\ScanTest.exe`, run it **from that
+Build `tools\ScanTest.c` to `%TEMP%\scantest\ScanTest.exe`
+(`cl /nologo /O2 /W3 ScanTest.c /Fe:ScanTest.exe`; it needs `advapi32`, which the
+source links via `#pragma comment`), run it **from that
 directory** with the DLL and an ini whose `HookModules=` is empty and
-`GpaThunks=false`. It:
+`GpaThunks=false`. `HookExe` is optional: `false` runs the default path, `true`
+also exercises the `veh add` / `ueh set` hook lines that the harness can
+provoke. It appends `progress.txt` in its working directory, so a
+failed run can be read in order. It:
 
 * loads `GameConsole.dll`,
 * installs two real `FF25` detours on `ntdll!NtOpenFile` / `ntdll!NtQueryInformationFile`
@@ -210,11 +228,13 @@ ntdll#1!NtOpenFile -> ScanTest.exe+0x1000  (hooked: FF25 abs jmp)
 
 ## Settings groups
 
+* console: `ConsoleVisible`, `AllocConsole` (false = log-file-only), `ConsoleTitle`, `ConsoleCols`, `ConsoleRows`, `ShowTimestamps`, `ShowColors`, `ShowLegend`, `ShowStartupInfo`
 * saving/log: `SaveLogFile`, `LogDirectory`, `SaveTaggedLines`, `SaveRawLines`, `WriteTraceFile`, `WriteCrashFile`, `CsvExport`
-* capture: `CaptureOutputDebugString`, `RedirectCrt`, `RedirectStdHandles`, `EnableCrashHandler`, `HoldOnCrash` (**freezes** the process on an unhandled crash)
-* show gates: one `Show_*` per tag group; `Show_System` gates `[SYS]/[KRNL]/[SVC]`, `[EH]` rides on `Show_Exceptions`
+* capture: `CaptureOutputDebugString`, `RedirectCrt`, `RedirectStdHandles`, `EnableCrashHandler`, `HoldOnCrash` (**freezes** the process on an unhandled crash; shipped ini sets false)
+* show gates: one `Show_*` per tag group; `Show_System` gates `[SYS]/[KRNL]/[SVC]`, `[EH]` rides on `Show_Exceptions`, `Show_Hooks` gates `[HOOK]`, and `[SCAN]` has no switch of its own — `CategoryOn` falls through to `Show_LogFiles` for any tag it does not recognise
 * hooks: `HookApis`, `HookFileReads`, `HookFileWrites`, `HookMemPatches`, `HookOnlyGameModules`, `HookLegacyNtdll`, `HookModules`, `HookExe` (false), `MaxHookReports`, `GpaThunks`
 * surveys: `CensusAll`, `CensusAllMax`, `ScanShadow`, `ShadowDetailMax`, `ScanLdr`, `ScanOtherHooks`, `ScanOtherHooksMax`, `ScanEh`, `ScanServices`, `ScanDrivers`, `ServiceWatch`, `ServiceWatchAll`, `WatchSharedData`, `MemGuardScan`, `MemGuardAll`
+* the remaining groups (modules, log tailing, exceptions, threads, memory, network, files, heartbeat, ODS) live in `README.md`'s settings table with their defaults — keep that table in sync with `Opts[]`
 
 ## Output tags and hook kinds
 
@@ -328,6 +348,9 @@ mutual probing), `veh add|remove`, `veh add continue`, `ueh set`, `regkey`
 * Plain C (MSVC, `/W3` clean), Windows-only, no external dependencies, no C++.
 * Keep ini comments adjacent to the switch they document; `README.md` is the
   user-facing description and must describe every switch, tag and hook kind.
+  The settings section of `README.md` carries a full table of all `Opts[]`
+  entries (key, default, meaning), so adding a setting means adding a row there
+  too — the table is the check that no switch is undocumented.
 * Build outputs are gitignored — the repo is the source of the tool, not the
   deployed artifact. After changing behaviour: `build.cmd`, run ScanTest, then
   commit; if a game was involved, say which title and paste the lines that prove
