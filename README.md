@@ -592,6 +592,22 @@ an emu do *to each other*:
   than guessed at, and a build where the query is refused says so once instead of
   staying silent.
 
+  Catching that pair is a race against this DLL's own startup: the loader reads
+  `artifact.json` and runs the whole sequence (dse.dll loads, DSE goes down, the
+  hypervisor service starts, DSE comes back up) within the first few tens of
+  milliseconds of the process. GameConsole therefore does the least possible
+  before its hooks are in — settings, the log file, the lock-free caller table,
+  exception capture, the module log, hooks — and only then allocates the console,
+  opens the CSV and runs the surveys. After that a **startup window** samples the
+  DSE state every 10 ms for about three seconds and re-tries hooking a module
+  that loads after this DLL on the same tight loop (normally once per second), so
+  `dse.dll` is instrumented within tens of milliseconds of loading and its
+  `LoadLibraryA`/`GetProcAddress` resolutions — and through them the calls it
+  makes — are logged. Outside the process, `tools\HostWatcher.c` can watch the
+  same transitions from a second window, which also shows the teardown
+  (service stopped / key removed, driver unloaded) that a log inside the game
+  cannot survive to record.
+
 - **CSV export** (`CsvExport`). A machine-readable `GameConsole_pid<pid>.csv`
   is written next to the log with one quoted row per census summary,
   non-image binding, shadow-survey finding, exec prologue, guard page, mailbox
@@ -675,3 +691,8 @@ breakpoints** (non-zero `Dr0–Dr3`/`Dr7` — that would be very interesting).
       VehProbe.c           raw lock-free-ring probe (event kinds, frames)
       CrashProbe.c         unhandled-crash / crash-file probe
       symlookup.c/.exe     resolves image+offset to symbol via DbgHelp/PDB
+      HostWatcher.c        external watcher: driver load/unload + DSE transitions,
+                           for the part of the sequence that runs outside the game
+                           process (start it before launching the title)
+      RunReport.ps1        summarises/compares a run log
+      ScanTest.c           the regression harness

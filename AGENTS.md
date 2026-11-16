@@ -28,10 +28,13 @@ explained), and `aaa58ce` before that.
 ScanTest was re-run green on 2026-11-16 (Win11 x64, VS 2022 Build Tools) at
 `69a499b`, again with the module-IAT registry bridge on top of `e0b2ede`, again
 at `8975eb6` with the code-integrity monitor, the direct-ntdll module probes
-(`qit`/`qvif`) and the returned-data previews, and again at `b645e8f` with the
-`qit(iat)` layer tag: exit=0, one `regkey`/`regset` each, 8 FF25 sites, VEH chain
-1→2, decoded `qvmm` data, 0 ESC bytes, 0 unattributed callers. `b645e8f` is what
-is deployed in all three game folders now. Update
+(`qit`/`qvif`) and the returned-data previews, at `b645e8f` with the `qit(iat)`
+layer tag, and again with the startup reorder + 3 s DSE window (commit after
+`b645e8f`): exit=0, one `regkey`/`regset` each, 8 FF25 sites, VEH chain 1→2,
+decoded `qvmm` data, the DSE baseline line present again after the reorder, 0 ESC
+bytes, 0 unattributed callers. The startup-reorder build is what is deployed in
+all three game folders now, but **no game has run on it yet** — the three-game
+evidence above is `8975eb6`. Update
 this line whenever you validate a change, so the next session knows what the last
 *proven* state was (`git log` is the tip; this line is about evidence, not
 recency).
@@ -79,23 +82,59 @@ by the script. Logs land in `<game>\logs\` (`.log` + `.csv`).
 
 ### Outstanding / next (in priority order)
 
-1. **Capture the driver *install*** — not yet observed, because `hyperkd` was
-   already installed and loaded before every session so far. To provoke it:
-   stop the game, delete `HKLM\SYSTEM\CurrentControlSet\Services\artifact`,
-   reboot (to unload `hyperkd`), then run a title. What to expect, now that
-   artifact's imports have been dumped (`dumpbin /imports`):
+1. **Capture the driver *install* — and it happens in-process, at startup.** The
+   real sequence was described by the user on 2026-11-16 and supersedes the
+   earlier "delete the key and reboot" recipe:
 
-   * `[HOOK] svc openmgr` → `svc create` → `svc start` — artifact imports
-     `OpenSCManagerW`/`CreateServiceW`/`StartServiceW`/`OpenServiceW`/
-     `ControlService`/`DeleteService` from `advapi32`, so this is the one step we
-     are certain to see from inside the game.
-   * `[SYS] code integrity CHANGED … - DSE was turned OFF` → the `svc` lines →
-     `[SYS] code integrity CHANGED … - DSE was turned back ON`: the helper
-     (`dse.dll`, user-confirmed) has to disable driver signature enforcement to
-     start an untrusted hypervisor, then restore it. This pair is the proof that
-     the driver really was installed *by this session*.
-   * `[SVC] driver service registered: …` → `is now LOADED` → `[KRNL] driver:
-     hyperkd.sys`.
+   1. launch the game exe by hand;
+   2. `winmm.dll` (the mod loader) reads `artifact.json` and loads its `load_dlls`
+      in order — `gameconsole.dll` **first**, so this DLL is in before the
+      protection's own startup;
+   3. `dse.dll` loads;
+   4. dse takes **DSE down** (driver signature enforcement off);
+   5. `artifact.dll` loads/registers and **starts the hypervisor service**;
+   6. dse puts **DSE back on**;
+   7. the hypervisor stays running, the game runs;
+   8. the game exits → the hypervisor is stopped, and the `artifact` service key
+      is gone afterwards (`sc query artifact` → error 1060 on a box that has run
+      a title and then been left alone).
+
+   So this is **not** provoked by deleting the key and rebooting a *game* — the
+   install is part of every launch — but it is a race against GameConsole's own
+   startup, because the whole thing completes within the first few tens of
+   milliseconds. That race is now fought explicitly: settings → log file →
+   caller table → VEH capture → module log → `InstallHooks` all run before the
+   console allocation, the CSV header and every survey (time from `DllMain` to
+   hooks ≈ 3 ms in the harness), and a **3 s startup window** then samples the DSE
+   state every 10 ms and retries pending hook targets every ~40 ms so a `dse.dll`
+   that loads after us is instrumented while it is still working.
+
+   What a successful capture looks like (all read-only, all already
+   implemented):
+   * `(iat) dse.dll loaded late - instrumented now (21 imports)` — then its
+     `gpa` lines for `LoadLibraryA`/`GetProcAddress`, which is how that stub
+     resolves everything it uses.
+   * `[HOOK] svc openmgr` → `svc create` → `svc start`, or with the service
+     already registered, `svc openmgr`/`svc start` — artifact imports the whole
+     SCM set from `advapi32` (`OpenSCManagerW`, `CreateServiceW`,
+     `StartServiceW`, `OpenServiceW`, `ControlService`, `DeleteService`).
+   * `[SYS] code integrity CHANGED … - DSE was turned OFF` … later
+     `… - DSE was turned back ON`. That pair is the proof that an unsigned
+     driver was loaded by this session.
+   * `[SVC] driver service registered: …` / `is now LOADED - the game started
+     it`, and `[KRNL] driver: hyperkd.sys`.
+
+   If a run instead shows `currently LOADED (already up at first scan - the mod
+   loads it during process startup)` with no `svc` lines and no DSE pair, the
+   race was lost for that launch — compare the timestamps of the first log line,
+   `hooks: IAT capture on` and the first `[SVC]` line before concluding anything
+   about the protection.
+
+   External cross-check: `tools\HostWatcher.c` (`cl /O2 /W3 HostWatcher.c`) polls
+   the DSE state every 50 ms plus the kernel module list and the driver-service
+   table every 500 ms, and prints only transitions. Start it *before* launching
+   the title: it sees the service appear and go away and the driver load/unload,
+   including the teardown a log inside the game cannot survive to record.
 
    **Do not expect `regkey`/`regset` for the service key from the game.** A
    service created through the SCM has its key written by `services.exe`, in
@@ -110,13 +149,6 @@ by the script. Logs land in `<game>\logs\` (`.log` + `.csv`).
    Then run `tools\RunReport.ps1 -Dir <game>\logs`: its "Driver / service install
    trace" section states outright whether any of that was captured. Take the
    run's service key **name** from the log, not from this note.
-
-   The 13:02/13:04 runs confirm the "already installed" state from inside: both
-   PB0 and PZ2 logged `[SVC] service: artifact … state=RUNNING` and
-   `[KRNL] driver: hyperkd.sys` in the first second, **zero** `svc`/`syst` lines,
-   and one `[SYS] code integrity: options 0x0000C001 … DSE on` with no change —
-   i.e. nothing had to be installed, so there was nothing to capture. Delete the
-   key and reboot before expecting item 1.
 2. **Hidden-module PE-size fix — validated in a game** (PB0, 2026-11-16):
    `hidden module: dse.dll @0x7FF9A81B0000 size 0x60000` and
    `hidden module: nvldumdx.dll @0x7FF9A8580000 size 0xD1000`, real
@@ -230,6 +262,8 @@ build.cmd                          # finds VS via vswhere, cl /LD /O2 /W3 -> Gam
 deploy.cmd                         # copies the DLL into a game folder (edit GAME= at the top)
 tools\ScanTest.c                   # the regression harness (below)
 tools\RunReport.ps1 [log]          # summarise/compare a run log (the recipe, scripted)
+tools\HostWatcher.c                # external watcher: DSE + driver load/unload from outside
+                                   #   the game (cl /O2 /W3 HostWatcher.c); start before the title
 tools\SingleHost.c                 # single-DLL host: LoadLibrary + hammered APIs + ODS + first-chance exception
 tools\peimports.ps1 <pe-file>      # raw PE import dump: proves the binding census is complete
 tools\symlookup.c                  # resolve <image>+<hex-offset> through the image's PDB (dbghelp)

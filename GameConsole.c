@@ -4898,6 +4898,13 @@ static void RunMonitors(long long n)
         if (ScanServices) ServicesScan(1);
     }
     if (MonThreads && n % 2 == 0) SafeCall(PollThreads);
+    // dse.dll switches driver signature enforcement off only for as long as it
+    // takes to start the hypervisor (seconds at most, and it happens right at
+    // startup when the driver is not yet loaded). On the slow cadence a short
+    // off/on pair can fall entirely between two samples, so for the first minute
+    // the DSE state is sampled every other tick. Still one read-only query, and
+    // CodeIntegrityInfo() only writes a line when the value actually changes.
+    if (ScanDrivers && n <= 240 && n % 2 == 0) SafeCall(CodeIntegrityInfo);
     if (MonNetwork && n % 8 == 0) SafeCall(PollNetwork);
     if (MonMemory && n % 20 == 0) SafeCall(PollMemory);
     if (CensusAll && g_pid && n % 20 == 0) SafeCall(CensusAllModules);
@@ -6404,7 +6411,8 @@ static void InstalledDriversScan(int first)
                     L"installed driver: %s type=0x%X start=%s image=%s - matches ServiceWatch (%s)",
                     g_instDrv[i].name, (unsigned)g_instDrv[i].type, SvcStartName(g_instDrv[i].start),
                     g_instDrv[i].image[0] ? g_instDrv[i].image : L"(no ImagePath)",
-                    now ? (g_instDrv[i].reported ? L"is now LOADED - the game started it" : L"currently LOADED")
+                    now ? (g_instDrv[i].reported ? L"is now LOADED - the game started it"
+                                                : L"currently LOADED (already up at first scan - the mod loads it during process startup)")
                        : (g_instDrv[i].reported ? L"is no longer loaded" : L"NOT currently loaded"));
                 Write(L"[SVC]", line);
                 CsvRow(L"svc-driver", g_instDrv[i].name, line, L"");
@@ -6874,23 +6882,23 @@ static DWORD WINAPI WorkerThread(LPVOID param)
     Trace(L"worker started");
     LoadSettings();
     Trace(L"settings loaded");
-    SetupConsole();
-    Trace(L"console ready");
+    // Time-to-hooks is the whole game here. The loader (winmm.dll) reads
+    // artifact.json and then loads dse.dll, dse switches driver signature
+    // enforcement off, artifact starts the hypervisor, dse switches it back on -
+    // all before the game proper runs (user-confirmed). On this box that whole
+    // sequence fits in the first few tens of milliseconds of the process, so
+    // everything that is not needed *by* the hooks is deferred until they are
+    // in: the console allocation, the CSV header, the surveys. What must stay in
+    // front of them is the saved log (so an early hook line is not lost), the
+    // lock-free caller table (hard rule 6) and the exception capture.
     OpenLogFile();
-    CsvOpen();
     if (g_logHandle != INVALID_HANDLE_VALUE)
     {
         WCHAR msg[900];
         StringCchPrintfW(msg, 900, L"saving log to %s", g_logPath);
         Write(L"[INFO]", msg);
     }
-    if (g_csvHandle != INVALID_HANDLE_VALUE)
-    {
-        WCHAR msg[900];
-        StringCchPrintfW(msg, 900, L"csv: %s", g_csvPath);
-        Write(L"[INFO]", msg);
-    }
-    { WCHAR msg[900]; StringCchPrintfW(msg, 900, L"settings file: %s", g_iniPath); Write(L"[INFO]", msg); }
+    if (ScanDrivers) CodeIntegrityInfo();          // DSE baseline, right after the log opens
     // Build the lock-free caller table BEFORE any hook is installed: the hook
     // path names callers from this table and must never call the loader APIs.
     RefreshCallerRanges();
@@ -6900,6 +6908,32 @@ static DWORD WINAPI WorkerThread(LPVOID param)
     InstallModuleLog();
     Trace(L"module log installed");
     if (HookApis) { InstallHooks(); Trace(L"hooks installed"); }
+    // Hooks are in - now the deferred, slower setup can happen.
+    SetupConsole();
+    Trace(L"console ready");
+    CsvOpen();
+    if (g_csvHandle != INVALID_HANDLE_VALUE)
+    {
+        WCHAR msg[900];
+        StringCchPrintfW(msg, 900, L"csv: %s", g_csvPath);
+        Write(L"[INFO]", msg);
+    }
+    // Startup capture window: dse.dll holds DSE down only for as long as the
+    // hypervisor takes to start, so for the next few seconds the state is
+    // sampled every 10 ms instead of on the monitor cadence, and modules that
+    // load after this DLL (dse.dll always does) are re-tried for hooking on the
+    // same tight loop - that is the last chance to catch the SCM calls from
+    // inside the boundary. Everything here is read-only and worker-side.
+    {
+        int k;
+        for (k = 0; k < 300; k++)                  // ~3 s
+        {
+            if (ScanDrivers) CodeIntegrityInfo();
+            if (k % 4 == 0) { HookLateModules(); ResolveCallerAddrs(); }
+            Sleep(10);
+        }
+    }
+    { WCHAR msg[900]; StringCchPrintfW(msg, 900, L"settings file: %s", g_iniPath); Write(L"[INFO]", msg); }
     if (ScanOtherHooks) { ScanNtdllHooks(1, ScanOtherHooksMax); Trace(L"hook scan done"); }
     if (ScanShadow || MonMemory) { SafeCall(PollMemory); Trace(L"memory baseline done"); }
     if (ScanShadow) { ShadowSurvey(1); Trace(L"shadow survey done"); }
