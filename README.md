@@ -163,6 +163,7 @@ repo overrides four of them: `HoldOnCrash=false`, `HookModules=artifact.dll,dse.
 | `HookLegacyNtdll` | `false` | Also allow legacy ntdll stub patching when `HookModules` is empty. **Dangerous**: races other mods' ntdll hooks |
 | `HookModules` | *(empty)* | Comma-separated module names whose IAT is instrumented, e.g. `artifact.dll`. Empty = no per-module IAT hooks, but the KERNELBASE interposition layer is still installed and logs all callers |
 | `HookExe` | `false` | Also instrument the game executable's own import table. OFF by default: a protected exe checks its own imports, and repointing them can fail its tamper check (`Corrupt pak index detected`) |
+| `HookHiddenModules` | `false` | Instrument the import table of a module that is in no loader list — found only by caller address, e.g. a protection helper DLL. OFF by default: such a module hides itself for a reason, and repointing its imports while it runs has ended the game at that exact instant on every launch that reached it. The module is still detected, censused and reported when this is false |
 | `MaxHookReports` | `2000` | Cap on hook log lines so a chatty caller cannot flood the console |
 | `GpaThunks` | `true` | `GetProcAddress` calls through `HookModules`' import table are logged AND return a logging thunk (counts + last caller, reported each heartbeat). `false` if a game verifies the returned pointer |
 
@@ -329,9 +330,14 @@ Two modes, selected by `HookModules`:
   `(iat) dse.dll is not loaded yet - will retry each heartbeat` →
   `(iat) dse.dll loaded late - instrumented now (N imports)`. A module that is
   in **no** loader list at all (`dse.dll`) cannot be resolved by name, so its
-  base is taken from the caller attribution and it is instrumented by address:
-  `(iat) dse.dll located by address (hidden module, absent from toolhelp32) -
-  instrumented now (N imports)`.
+  base is taken from the caller attribution: it is reported, censused and added
+  to the caller table, and then it is **left alone** —
+  `(iat) dse.dll is a hidden module (absent from toolhelp32) - reported but NOT
+  instrumented (HookHiddenModules=false)`. `HookHiddenModules=true` restores the
+  older behaviour of repointing its imports by address; that is off by default
+  because on PB0 every launch that reached a hidden module died at exactly that
+  point (hidden-module line → census → `HookExe`-style fatal error), and a run
+  that kills the game is a failed run.
 
 - **`HookExe`** (default **off**) adds the game executable's own basename to the
   instrumented list, so its file/registry/memory/exception-handler imports are

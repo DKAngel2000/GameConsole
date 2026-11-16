@@ -29,12 +29,16 @@ ScanTest was re-run green on 2026-11-16 (Win11 x64, VS 2022 Build Tools) at
 `69a499b`, again with the module-IAT registry bridge on top of `e0b2ede`, again
 at `8975eb6` with the code-integrity monitor, the direct-ntdll module probes
 (`qit`/`qvif`) and the returned-data previews, at `b645e8f` with the `qit(iat)`
-layer tag, and again at `630b2fd` with the startup reorder + 3 s DSE window:
-exit=0, one `regkey`/`regset` each, 8 FF25 sites, VEH chain 1→2,
-decoded `qvmm` data, the DSE baseline line present again after the reorder, 0 ESC
-bytes, 0 unattributed callers. The startup-reorder build is what is deployed in
-all three game folders now, but **no game has run on it yet** — the three-game
-evidence above is `8975eb6`. Update
+layer tag, at `630b2fd` with the startup reorder + 3 s DSE window, and again with
+the hidden-module guard and the process-start diagnostic (commit after `630b2fd`):
+exit=0, one `regkey`/`regset` each, 8 FF25 sites, VEH chain 1→2, decoded `qvmm`
+data, the DSE baseline line and `process created … worker started +N ms later`,
+0 ESC bytes, 0 unattributed callers. The hidden-module-guard build is what is
+deployed in all three game folders now, but **no game has yet survived a session
+on a build with the guard**: the three-game evidence above is `8975eb6`, and the
+three PB0 runs at 14:14/14:15/14:16 (on `630b2fd`) all died at the hidden-module
+step reported in item 6. Until PB0 runs clean on it, treat the guard as
+unvalidated in a game. Update
 this line whenever you validate a change, so the next session knows what the last
 *proven* state was (`git log` is the tip; this line is about evidence, not
 recency).
@@ -170,11 +174,33 @@ by the script. Logs land in `<game>\logs\` (`.log` + `.csv`).
 5. Optional RE: name artifact's VEH handler for PZ2/FFRS. It is *not* in the OS
    chain (private list), so it needs a read-only hunt for the protection's own
    list — nothing yet.
-6. **PB0's 12:38 death was a one-off** (resolved 2026-11-16 13:02): re-ran PB0 on
-   the same build path and it ran 13:02:56→13:04:00 to a normal exit — engine
-   shutdown visible in `[raw]` (`Puerts: ~FScriptArrayEx` teardown), no
-   `[CRASH]`, no `%TEMP%\GameConsole_crash.log`, no WER entry, no hidden module
-   this time. Nothing suggests the dse census; do not chase it unless it recurs.
+6. **PB0 dies the moment a hidden module is instrumented by address — root-caused
+   and fixed** (2026-11-16). History: the 12:38 PB0 run ended abruptly with no
+   `[CRASH]`, no crash file and no WER entry; the 13:02 run survived and I
+   wrongly closed it as a one-off. The three launches at 14:14/14:15/14:16 settle
+   it: **all three** end on the same two lines —
+
+   ```
+   [SCAN] hidden module: dse.dll @0x7FF980940000 size 0x60000 type 0x1000000 protect 0x2 ...
+   [SCAN] binding census for dse.dll: 21 imports (0 unbound) in 19 descriptor(s) ...
+   ```
+
+   — and nothing after, 3.7–5 s into the session, with the UE fatal-error dialog
+   on screen. The surviving 13:02 run is the one that never detected dse.dll
+   (`hidden modules: 0`). The next thing that code does is `HookOneModule` on the
+   hidden module, i.e. **`VirtualProtect` + rewrite of dse.dll's import table by
+   address** — the one write this tool performs in another module's memory that
+   the owning module has not asked for. `HookHiddenModules` (default **false**)
+   now stops there: a hidden module is detected, censused, reported and added to
+   the caller table, but not repointed. Re-run and if PB0 survives to a normal
+   exit the cause is confirmed; the newest logs also carry
+   `process created HH:MM:SS.mmm - this worker started +N ms later`, which is the
+   number to quote when judging whether a launch was in time at all.
+
+   Related, and worth reading before the next attempt: the install itself is
+   visible from outside even when it is not visible in-process —
+   `tools\HostWatcher.log` from that session shows the whole cycle (see the
+   kernel-agent bullet in Domain knowledge).
 
 ### How to read a run (quick recipe)
 
@@ -362,7 +388,7 @@ Verified 2026-11-16 at `69a499b` on Win11 Pro x64 with VS 2022 Build Tools
 | surveys | `ScanNtdllHooks`(+`ScanNtdllImage`), `ShadowSurvey`/`DecodeExecPrologue`, `LdrSurvey`/`LdrWalkList` (per-list cycle detection) |
 | exception chain | `VehChainSurvey`, `VehFindLayout` (runtime layout + `RtlEncodePointer`), `VehHandlerOf`, `VehDescribe` |
 | system view | `CpuTopologyInfo` (CPUID + cross-reference, change-detected), `CodeIntegrityInfo` (DSE state via `NtQuerySystemInformation` class 103, change-detected), `DriversScan` (`g_drvMatch`), `InstalledDriversScan` (`DrvIsLoaded` by image basename), `ServicesScan`, `WatchMatch`/`ServiceWatch` |
-| hidden modules | `ImageSizeAt` (PE `SizeOfImage`), `g_hiddenReported2` |
+| hidden modules | `ImageSizeAt` (PE `SizeOfImage`), `g_hiddenReported2`; detected in `ResolveCallerAddrs`, which reports/censuses a hidden module and adds its range, then stops unless `HookHiddenModules` is on (see item 6) |
 | monitors | threads, exec memory, network, filesystem watchers (incl. the `.sys` classifier), heartbeat, guard pages, KUSER_SHARED_DATA mailbox |
 
 ## Settings groups
@@ -371,7 +397,7 @@ Verified 2026-11-16 at `69a499b` on Win11 Pro x64 with VS 2022 Build Tools
 * saving/log: `SaveLogFile`, `LogDirectory`, `SaveTaggedLines`, `SaveRawLines`, `WriteTraceFile`, `WriteCrashFile`, `CsvExport`
 * capture: `CaptureOutputDebugString`, `RedirectCrt`, `RedirectStdHandles`, `EnableCrashHandler`, `HoldOnCrash` (**freezes** the process on an unhandled crash; shipped ini sets false)
 * show gates: one `Show_*` per tag group; `Show_System` gates `[SYS]/[KRNL]/[SVC]`, `[EH]` rides on `Show_Exceptions`, `Show_Hooks` gates `[HOOK]`, and `[SCAN]` has no switch of its own — `CategoryOn` falls through to `Show_LogFiles` for any tag it does not recognise
-* hooks: `HookApis`, `HookFileReads`, `HookFileWrites`, `HookMemPatches`, `HookOnlyGameModules`, `HookLegacyNtdll`, `HookModules`, `HookExe` (false), `MaxHookReports`, `GpaThunks`
+* hooks: `HookApis`, `HookFileReads`, `HookFileWrites`, `HookMemPatches`, `HookOnlyGameModules`, `HookLegacyNtdll`, `HookModules`, `HookExe` (false), `HookHiddenModules` (false), `MaxHookReports`, `GpaThunks`
 * surveys: `CensusAll`, `CensusAllMax`, `ScanShadow`, `ShadowDetailMax`, `ScanLdr`, `ScanOtherHooks`, `ScanOtherHooksMax`, `ScanEh`, `ScanServices`, `ScanDrivers`, `ServiceWatch`, `ServiceWatchAll`, `WatchSharedData`, `MemGuardScan`, `MemGuardAll`
 * the remaining groups (modules, log tailing, exceptions, threads, memory, network, files, heartbeat, ODS) live in `README.md`'s settings table with their defaults — keep that table in sync with `Opts[]`
 
@@ -458,6 +484,41 @@ was patched" is the point of the tool, and a bare pointer is not evidence.
   `NtLoadDriver`/`ZwLoadDriver` are imported by none of them: the load goes
   through `CreateServiceW` + `StartServiceW` + registry (`ImagePath`/`Type`/`Start`).
   Loaded without the CPUID hypervisor bit (see hard rule 9).
+* **The whole install/teardown cycle, observed from outside** (HostWatcher, PB0
+  2026-11-16 — three launches). Each launch, in order:
+  * three kernel images appear together from `<game>\Artifact_Intel\`:
+    `hyperkd.sys` (0x7000), `hyperhv.dll` (0x8A000), `hyperevade.dll` (0x7000) —
+    note two of the three carry a `.dll` name while being kernel modules;
+  * service `artifact` goes `START_PENDING` → `RUNNING` about 0.6 s later
+    (ImagePath is `hyperkd.sys`, so the key name still says nothing about the
+    file);
+  * **DSE is taken down by loading a vulnerable signed driver, not by a CI API**:
+    `RTCORE64.SYS` (0x6000) appears from
+    `%TEMP%\dsedll\RTCore64.sys` — MSI Afterburner's known-vulnerable driver, the
+    classic BYOVD route to disable driver signature enforcement — and is gone
+    again within ~0.6 s (it is only caught when the 500 ms poll lands inside that
+    window, which is why it shows in one cycle out of three);
+  * on exit: the three images unload, the service goes `RUNNING` → `STOPPED`, and
+    the `artifact` key is **removed** ~0.7 s later (`sc query artifact` → 1060),
+    so a box that has run a title and then been left alone has no service and no
+    loaded driver.
+  * Cycle-to-cycle timings from the same log: install 14:16:08.556 → service
+    RUNNING 14:16:09.210, teardown 14:16:33.338 → key gone 14:16:33.994.
+* **The install happens before GameConsole's worker starts** — that is why no run
+  has ever shown `svc create` from inside. In the 14:16 launch the driver was up
+  at 14:16:08.5 while the game's first log line is 14:16:12.050, i.e. **3.5 s
+  later**, and `GetModuleHandleW(L"dse.dll")` still returned NULL at 12.066 even
+  though dse had already done the DSE work. Two readings are possible (our worker
+  was starved, or the loader loads `load_dlls` after the driver is up); the new
+  `process created … this worker started +N ms later` line answers it on the next
+  run. Either way, an in-process capture of the SCM calls needs `gameconsole.dll`
+  earlier in `artifact.json`, and until then the watcher is the instrument for
+  the install.
+* **dse.dll calls back into us ~4 s after the game starts** (~7–8 s after the
+  service started): in all three launches its first hooked-API call arrived at
+  3.7/4.0/4.4 s and was what got it detected. That call itself is invisible as a
+  `[HOOK]` line because the hook path can only queue an address it cannot name —
+  which is exactly how the hidden module is found a moment later.
 * **The protection's VEH handler is only visible in PB0.** PB0's chain:
   `[EH] veh chain[0] (first): GameConsole.dll+… [GameConsole]` then
   `[EH] veh chain[1] (last): artifact.dll+0x1211A`. PZ2/FFRS show **only** our
@@ -516,8 +577,15 @@ was patched" is the point of the tool, and a bare pointer is not evidence.
 * Caller naming must not use the loader; unresolved callers are queued by
   address and resolved on the worker, which also refreshes the table **before**
   deciding hidden-or-not (an on-demand DLL was once mislabelled, `NSI.dll`).
-* A mod's helper DLL loads *after* this DLL: unresolved hook targets are logged,
-  retried each heartbeat, and a hidden module is hooked **by address**.
+* A mod's helper DLL loads *after* this DLL: unresolved hook targets are logged
+  and retried (every ~40 ms during the 3 s startup window, then once a second).
+  A hidden module is **not** hooked by default — rewriting the import table of a
+  module that hides itself from the loader killed PB0 at that instant, every
+  launch that reached it (item 6). Report and census it; `HookHiddenModules=true`
+  only when a dying session is acceptable.
+* Repointing an import table is a *write*, even though it is not code: for a
+  module the tool did not load and cannot name through the loader, treat it as
+  tampering and leave it alone. The KERNELBASE layer still sees its calls.
 * `HoldOnCrash=true` + an unhandled crash = a process frozen in `Sleep(INFINITE)`
   ("held open"), which looks exactly like a hang. Set it to false when testing.
 * A service key name is not a driver file name (service `artifact` →

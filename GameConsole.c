@@ -139,6 +139,7 @@ static int ScanServices = 1;         // SCM service scan
 static int ScanDrivers = 1;          // loaded kernel modules
 static int ServiceWatchAll = 0;      // list everything, not just the watch list
 static int HookExe = 1;              // also instrument the game exe's IAT
+static int HookHiddenModules = 0;    // rewrite a hidden module's IAT (off: a crash suspect)
 static WCHAR ServiceWatch[400] = L"denuvo,hypervisor,hvservice,hyperkd,simplesvm,vgk,vgc,vanguard,easyanticheat,battleye,beservice,bedaisy,nprotect,gameguard,xigncode,arxan,vmprotect,themis,xtrap";
 #define MAX_SHADOWSEEN 64
 static ULONG_PTR g_shadowSeen[MAX_SHADOWSEEN]; static int g_nShadowSeen = 0;
@@ -251,6 +252,7 @@ static const Opt Opts[] = {
     { "HookLegacyNtdll", "false", "Also allow the legacy ntdll stub patching when HookModules is empty. Dangerous: races other mods' ntdll hooks" },
     { "HookModules", "", "Comma-separated module names whose IAT is instrumented, e.g. artifact.dll. Empty = no per-module IAT hooks, but the KERNELBASE interposition layer is still installed and logs ALL callers" },
     { "HookExe", "false", "Also instrument the game executable's own import table. OFF by default: a Denuvo-protected exe checks its own imports, and repointing them can make it fail its own tamper check (seen as 'corrupt pak index' in UE titles). Turn on only when you need the exe's own first-hop calls" },
+    { "HookHiddenModules", "false", "Instrument the import table of a module that is in no loader list (found only by caller address, e.g. a protection helper). OFF by default: such a module is deliberately hidden from the loader, and repointing its imports while it runs has killed the game at that exact moment three times out of three. It is still detected, censused and reported when this is false" },
     { "MaxHookReports", "2000", "Cap on hook log lines so a chatty caller cannot flood the console" },
     { "#", "", "Read-only survey: what OTHER code has already inline-hooked ntdll" },
     { "ScanOtherHooks", "true", "Read-only ntdll survey: report EVERY export whose entry is a jump instead of a clean syscall stub, classified - hooked by other module / same-image alias / NON-EXPORT same-image target (cave). Runs at startup and re-runs each heartbeat (new sites only). Never writes anything" },
@@ -484,7 +486,7 @@ static void LoadSettings(void)
     ScanLdr = B("ScanLdr");
     ScanEh = B("ScanEh"); ScanServices = B("ScanServices"); ScanDrivers = B("ScanDrivers");
     ServiceWatchAll = B("ServiceWatchAll");
-    HookExe = B("HookExe");
+    HookExe = B("HookExe"); HookHiddenModules = B("HookHiddenModules");
     TrimToW(V("ServiceWatch"), ServiceWatch, 400);
     MemGuardScan = B("MemGuardScan"); CsvExport = B("CsvExport"); MemGuardAll = B("MemGuardAll");
 }
@@ -3845,11 +3847,30 @@ static void ResolveCallerAddrs(void)
         if (IsPendingHook(name))
         {
             WCHAR msg[400];
-            int n = HookOneModule(m, name);
-            StringCchPrintfW(msg, 400, L"(iat) %s located by address (hidden module, absent from toolhelp32) - instrumented now (%d imports)", name, n);
-            HookNote(msg);
-            CsvRow(L"hook-late", name, msg, L"");
-            HookClearPending(name);
+            if (!HookHiddenModules)
+            {
+                // Reported, censused and named - but deliberately NOT rewritten.
+                // A module that is in no loader list keeps itself hidden for a
+                // reason, and repointing its imports while it is running has
+                // ended the game at that exact instant three times out of three
+                // on PB0 (the row is `[SVC]/[SCAN] hidden module` followed by
+                // the census, then a UE fatal error). Observation is cheap;
+                // tampering with the helper is not. Opt in with
+                // HookHiddenModules=true when a session can afford to die.
+                StringCchPrintfW(msg, 400,
+                    L"(iat) %s is a hidden module (absent from toolhelp32) - reported but NOT instrumented (HookHiddenModules=false)", name);
+                HookNote(msg);
+                CsvRow(L"hook-hidden", name, msg, L"");
+                HookClearPending(name);
+                continue;
+            }
+            {
+                int n = HookOneModule(m, name);
+                StringCchPrintfW(msg, 400, L"(iat) %s located by address (hidden module, absent from toolhelp32) - instrumented now (%d imports)", name, n);
+                HookNote(msg);
+                CsvRow(L"hook-late", name, msg, L"");
+                HookClearPending(name);
+            }
         }
     }
 }
@@ -6897,6 +6918,31 @@ static DWORD WINAPI WorkerThread(LPVOID param)
         WCHAR msg[900];
         StringCchPrintfW(msg, 900, L"saving log to %s", g_logPath);
         Write(L"[INFO]", msg);
+    }
+    {
+        // How long after the process was created did this worker get going? The
+        // protection's own startup (load dse.dll, take DSE down, start the
+        // hypervisor, put DSE back) happens around this point, so the delta says
+        // whether we were in time to see any of it - and it is the number to
+        // quote when the loader is rearranged in artifact.json.
+        FILETIME ct, et, kt, ut;
+        if (GetProcessTimes(GetCurrentProcess(), &ct, &et, &kt, &ut))
+        {
+            ULARGE_INTEGER a, b;
+            SYSTEMTIME st;
+            ULONGLONG d;
+            WCHAR msg[320];
+            a.LowPart = ct.dwLowDateTime; a.HighPart = ct.dwHighDateTime;
+            b.LowPart = g_startTime.dwLowDateTime; b.HighPart = g_startTime.dwHighDateTime;
+            FILETIME lt;
+            d = (b.QuadPart - a.QuadPart) / 10000ull;   // 100ns ticks -> ms
+            if (!FileTimeToLocalFileTime(&ct, &lt)) lt = ct;
+            FileTimeToSystemTime(&lt, &st);
+            StringCchPrintfW(msg, 320,
+                L"process created %02u:%02u:%02u.%03u - this worker started +%llu ms later",
+                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, d);
+            Write(L"[INFO]", msg);
+        }
     }
     if (ScanDrivers) CodeIntegrityInfo();          // DSE baseline, right after the log opens
     // Build the lock-free caller table BEFORE any hook is installed: the hook
