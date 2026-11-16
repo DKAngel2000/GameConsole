@@ -16,10 +16,12 @@ remote `origin`). Source-only: `*.dll`, `*.exe`, `*.obj`, `logs/`, `*.log`,
 
 **Last behaviour-validated commit**: `aaa58ce` ("Log the hypervisor properly,
 fix the loaded-driver check, drop legion") — ScanTest green and all three games
-ran to a normal exit with it. `81a1dbe` on top of it only rewrites `AGENTS.md`,
-so the tip has the same behaviour as the validated commit. Update this line
-whenever you validate a change, so the next session knows what the last *proven*
-state was (`git log` is the tip; this line is about evidence, not recency).
+ran to a normal exit with it. ScanTest was re-run green at `69a499b` on
+2026-11-16 (Win11 x64, VS 2022 Build Tools), so the harness half still holds at
+the tip; the three-game half has **not** been re-run since `aaa58ce`. Update this
+line whenever you validate a change, so the next session knows what the last
+*proven* state was (`git log` is the tip; this line is about evidence, not
+recency).
 
 **Tooling on the old box (Windows 11, x64)**: MSVC via `vswhere` (no VS project
 files), `git` with the Windows credential manager stored credential for GitHub.
@@ -172,14 +174,11 @@ history; use `SingleHost.c`/`ScanTest.c` instead. (`SingleHost.c` needs
 
 ### Regression harness
 
-Build `tools\ScanTest.c` to `%TEMP%\scantest\ScanTest.exe`
-(`cl /nologo /O2 /W3 ScanTest.c /Fe:ScanTest.exe`; it needs `advapi32`, which the
-source links via `#pragma comment`), run it **from that
-directory** with the DLL and an ini whose `HookModules=` is empty and
-`GpaThunks=false`. `HookExe` is optional: `false` runs the default path, `true`
-also exercises the `veh add` / `ueh set` hook lines that the harness can
-provoke. It appends `progress.txt` in its working directory, so a
-failed run can be read in order. It:
+Build `tools\ScanTest.c` to `%TEMP%\scantest\ScanTest.exe` with
+`cl /nologo /O2 /W3 ScanTest.c /Fe:ScanTest.exe` (it links `advapi32` via
+`#pragma comment`), copy `GameConsole.dll` in beside it, and run it **from that
+directory**. It appends `progress.txt` in its working directory, so a failed run
+can be read in order. It:
 
 * loads `GameConsole.dll`,
 * installs two real `FF25` detours on `ntdll!NtOpenFile` / `ntdll!NtQueryInformationFile`
@@ -188,24 +187,56 @@ failed run can be read in order. It:
 * loads `version.dll` **after** the DLL (late-load retry path),
 * writes a registry value shaped like a driver `ImagePath`.
 
-A good run is `exit=0` plus all of:
+The ini is part of the test — four switches have to be set, each for a different
+assertion (do not "simplify" this back to an empty `HookModules`):
 
 ```
-ntdll#1!NtOpenFile -> ScanTest.exe+0x1000  (hooked: FF25 abs jmp)
+HookModules=version.dll   # without a name to retry there are no late-load lines
+HookExe=true              # else the exe's own IAT is untouched -> no veh/ueh lines
+GpaThunks=false           # else GetProcAddress returns a logging thunk, the detours
+                          # patch that thunk, and the survey finds no ntdll site
+HeartbeatSeconds=10
+HoldOnCrash=false
+```
+
+`GpaThunks=true` is the one real trade-off: it produces the
+`[HOOK] gpa <api> called N ... last caller ScanTest.exe+0x…` counters, but then
+the detours land on the thunk rather than the ntdll stub and the
+`ntdll#1!NtOpenFile -> …` line does **not** appear. A single run cannot show both.
+Also delete `HKCU\Software\GameConsoleScanTest` before a run: `regkey` logs
+CREATED only, so on a second run the key already exists and `regset` appears
+alone.
+
+A good run is `exit=0` (`progress.txt` ends `wmain: returning`) plus all of:
+
+```
 [HOOK] (iat) KERNELBASE interposition layer: 20 Nt* imports hooked across 1 KERNELBASE image(s)
-[EH] veh chain: 1 handler(s) ...      then on the rescan: 2 handler(s)
 [HOOK] (iat) version.dll is not loaded yet - will retry each heartbeat ...
-[HOOK] (iat) version.dll loaded late - instrumented now (N imports)
-[HOOK] regkey st=0x00000000 CREATED "..."   +   [HOOK] regset ... ImagePath type=.. = ...  <- ScanTest.exe+0x...
+[HOOK] (iat) version.dll loaded late - instrumented now (6 imports)
+[HOOK] regkey st=0x00000000 CREATED "Software\GameConsoleScanTest"  <- ScanTest.exe+0x...
+[HOOK] regset st=0x00000000 "\...\GameConsoleScanTest"\ImagePath type=1 size=82 = \SystemRoot\System32\drivers\hyperkd.sys  <- ScanTest.exe+0x...
+[HOOK] veh    add first handler=ScanTest.exe+0x... st=0x00000000  <- ScanTest.exe+0x...
+[HOOK] ueh    set filter=ScanTest.exe+0x... previous=0x...  <- ScanTest.exe+0x...
+[EH] veh chain: 1 handler(s) ...      then on the rescan: 2 handler(s), both named
+[SCAN] ntdll#1!NtOpenFile -> ScanTest.exe+0x1000  (hooked: FF25 abs jmp)
+[SCAN] ntdll survey across 1 image(s): 4 anomalous entries - 4 hooked outside ntdll, ...
+[SCAN] ldr survey: load-order N / memory-order N / init-order N ...
 [SYS] hypervisor: no CPUID hypervisor leaf ...; ServiceWatch kernel module(s) loaded: hvservice.sys ...
 [SVC] installed driver: hvservice ... (currently LOADED)
 [MEM] 1 low-address guard/no-access pages tracked (...)
-[SCAN] ldr survey: load-order N / memory-order N / init-order N ...
 ```
 
-…plus **zero** `0x1B` (ESC) bytes in the log, one guard-page summary line, no
-`hidden module:` false positives (an on-demand DLL must not be mislabelled), no
-`<- 0x…` unattributed callers, and `bindings tally` lines that sum correctly.
+The detour shows up as **four** anomalous entries (the Nt and Zw stubs share
+their code, so each detour shows twice, counted as "hooked outside ntdll"), and
+the `veh`/`ueh` lines are padded (`veh    add`, `ueh    set`). …plus **zero**
+`0x1B` (ESC) bytes in the log, one guard-page summary line, no `hidden module:`
+false positives (an on-demand DLL must not be mislabelled), no `<- 0x…`
+unattributed callers, and every `binding census … (tally sums to N)` line
+agreeing with the import count it reports. `[SYS]/[SVC]/[MEM]` depend on the box
+(`hvservice.sys` here); the rest do not.
+
+Verified 2026-11-16 at `69a499b` on Win11 Pro x64 with VS 2022 Build Tools
+17.14.45 / SDK 22621: exit=0, all of the above, 0 ESC bytes, no false positives.
 
 ## Source map (`GameConsole.c`)
 
