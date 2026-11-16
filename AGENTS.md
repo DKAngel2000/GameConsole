@@ -1,4 +1,4 @@
-# AGENTS.md — working notes for GameConsole
+﻿# AGENTS.md â€” working notes for GameConsole
 
 Context for anyone (human or agent) picking this repository up, written as a
 handover: state first, then the rules and the knowledge. Most of it was learned
@@ -8,20 +8,20 @@ the hard way on real Denuvo titles.
 
 **Repository** `https://github.com/DKAngel2000/GameConsole` (branch `main`,
 remote `origin`). Source-only: `*.dll`, `*.exe`, `*.obj`, `logs/`, `*.log`,
-`*.csv` are gitignored, so the built DLL is *not* in the repo — run `build.cmd`.
+`*.csv` are gitignored, so the built DLL is *not* in the repo â€” run `build.cmd`.
 `.gitattributes` pins LF for text (`*.c/*.h/*.md/*.ini/*.ps1`, CRLF for
 `*.cmd/*.bat`, binary for build outputs); `core.autocrlf=true` is set, so
 `git ls-files --eol` should show `i/lf w/lf` for sources and docs, and
-`i/lf w/crlf` for `*.cmd`/`*.bat` (checkout conversion, by design — not drift).
+`i/lf w/crlf` for `*.cmd`/`*.bat` (checkout conversion, by design â€” not drift).
 
-**Last behaviour-validated commit**: `8975eb6` for the three-game half — the
+**Last behaviour-validated commit**: `8975eb6` for the three-game half â€” the
 deployed DLL in all three folders hashed identical to the repo build, and **all
-three** titles ran to a normal exit: PB0 13:02:56→13:04:00, FFRS
-13:02:09→13:02:37, PZ2 13:04:15→13:04:57. FFRS's only WER entry is the known
+three** titles ran to a normal exit: PB0 13:02:56â†’13:04:00, FFRS
+13:02:09â†’13:02:37, PZ2 13:04:15â†’13:04:57. FFRS's only WER entry is the known
 cosmetic `apphelp.dll` `0xC0000409`; PB0 and PZ2 left none. That run is also the
 first game-side evidence for the code-integrity monitor (one `[SYS] code
-integrity: options 0x0000C001 (enabled undecoded 0x6) … DSE on` per run, no
-change — the driver was already loaded) and for the module-level ntdll probe
+integrity: options 0x0000C001 (enabled undecoded 0x6) â€¦ DSE on` per run, no
+change â€” the driver was already loaded) and for the module-level ntdll probe
 hooks. Before it, `0cabdee` had all three exit cleanly except PB0 (item 6, now
 explained), and `aaa58ce` before that.
 
@@ -30,9 +30,9 @@ ScanTest was re-run green on 2026-11-16 (Win11 x64, VS 2022 Build Tools) at
 at `8975eb6` with the code-integrity monitor, the direct-ntdll module probes
 (`qit`/`qvif`) and the returned-data previews, at `b645e8f` with the `qit(iat)`
 layer tag, at `630b2fd` with the startup reorder + 3 s DSE window, and again with
-the hidden-module guard and the process-start diagnostic (commit after `630b2fd`):
-exit=0, one `regkey`/`regset` each, 8 FF25 sites, VEH chain 1→2, decoded `qvmm`
-data, the DSE baseline line and `process created … worker started +N ms later`,
+the hidden-module guard and the process-start diagnostic (`9391ed4`):
+exit=0, one `regkey`/`regset` each, 8 FF25 sites, VEH chain 1â†’2, decoded `qvmm`
+data, the DSE baseline line and `process created â€¦ worker started +N ms later`,
 0 ESC bytes, 0 unattributed callers. The hidden-module-guard build is what is
 deployed in all three game folders now, but **no game has yet survived a session
 on a build with the guard**: the three-game evidence above is `8975eb6`, and the
@@ -48,7 +48,7 @@ files), `git` with the Windows credential manager stored credential for GitHub.
 There is **no `gh` CLI**, so PRs/issues/releases are not scripted here. Pushing
 works with `git push origin main` (set `GIT_TERMINAL_PROMPT=0` so it fails fast
 instead of blocking on a prompt). Shell note: the agent shell cannot parse
-`<<'EOF'` heredocs — write commit messages to a temp file and use
+`<<'EOF'` heredocs â€” write commit messages to a temp file and use
 `git commit -F <file>`. Before assuming you can build, check for `vswhere`:
 a machine without the VS C++ tools installed cannot run `build.cmd` or the
 harness, and the repo carries no binaries, so validation has to happen on a box
@@ -75,9 +75,9 @@ HoldOnCrash=false        # true = Sleep(INFINITE) on an unhandled crash, which l
 
 | game | exe (folder) | notes |
 |---|---|---|
-| PB0 "Phantasy Blade 0" | `PBZ.exe` in `…\platform\steam\` | newer artifact: relinked loader lists, artifact's VEH visible in the OS chain |
+| PB0 "Phantasy Blade 0" | `PBZ.exe` in `â€¦\platform\steam\` | newer artifact: relinked loader lists, artifact's VEH visible in the OS chain |
 | PZ2 "Planet Zoo 2" | `PlanetZoo2.exe` in the game root | Cobra engine + V8; newest artifact: relinked loader lists, private VEH list |
-| FFRS "Final Fantasy Resonance" | `FFRS-Win64-Shipping.exe` in `…\FFRS\Binaries\Win64\` | Unreal; **older** artifact: clean loader lists, real `SizeOfImage`, no CPUID/hypervisor probing |
+| FFRS "Final Fantasy Resonance" | `FFRS-Win64-Shipping.exe` in `â€¦\FFRS\Binaries\Win64\` | Unreal; **older** artifact: clean loader lists, real `SizeOfImage`, no CPUID/hypervisor probing |
 
 `deploy.cmd` copies `GameConsole.dll` into a game folder (edit its `GAME=` line;
 default FFRS) and reminds that `artifact.json` must list `gameconsole.dll` in
@@ -86,51 +86,51 @@ by the script. Logs land in `<game>\logs\` (`.log` + `.csv`).
 
 ### Outstanding / next (in priority order)
 
-1. **Capture the driver *install* — and it happens in-process, at startup.** The
+1. **Capture the driver *install* â€” and it happens in-process, at startup.** The
    real sequence was described by the user on 2026-11-16 and supersedes the
    earlier "delete the key and reboot" recipe:
 
    1. launch the game exe by hand;
    2. `winmm.dll` (the mod loader) reads `artifact.json` and loads its `load_dlls`
-      in order — `gameconsole.dll` **first**, so this DLL is in before the
+      in order â€” `gameconsole.dll` **first**, so this DLL is in before the
       protection's own startup;
    3. `dse.dll` loads;
    4. dse takes **DSE down** (driver signature enforcement off);
    5. `artifact.dll` loads/registers and **starts the hypervisor service**;
    6. dse puts **DSE back on**;
    7. the hypervisor stays running, the game runs;
-   8. the game exits → the hypervisor is stopped, and the `artifact` service key
-      is gone afterwards (`sc query artifact` → error 1060 on a box that has run
+   8. the game exits â†’ the hypervisor is stopped, and the `artifact` service key
+      is gone afterwards (`sc query artifact` â†’ error 1060 on a box that has run
       a title and then been left alone).
 
-   So this is **not** provoked by deleting the key and rebooting a *game* — the
-   install is part of every launch — but it is a race against GameConsole's own
+   So this is **not** provoked by deleting the key and rebooting a *game* â€” the
+   install is part of every launch â€” but it is a race against GameConsole's own
    startup, because the whole thing completes within the first few tens of
-   milliseconds. That race is now fought explicitly: settings → log file →
-   caller table → VEH capture → module log → `InstallHooks` all run before the
+   milliseconds. That race is now fought explicitly: settings â†’ log file â†’
+   caller table â†’ VEH capture â†’ module log â†’ `InstallHooks` all run before the
    console allocation, the CSV header and every survey (time from `DllMain` to
-   hooks ≈ 3 ms in the harness), and a **3 s startup window** then samples the DSE
+   hooks â‰ˆ 3 ms in the harness), and a **3 s startup window** then samples the DSE
    state every 10 ms and retries pending hook targets every ~40 ms so a `dse.dll`
    that loads after us is instrumented while it is still working.
 
    What a successful capture looks like (all read-only, all already
    implemented):
-   * `(iat) dse.dll loaded late - instrumented now (21 imports)` — then its
+   * `(iat) dse.dll loaded late - instrumented now (21 imports)` â€” then its
      `gpa` lines for `LoadLibraryA`/`GetProcAddress`, which is how that stub
      resolves everything it uses.
-   * `[HOOK] svc openmgr` → `svc create` → `svc start`, or with the service
-     already registered, `svc openmgr`/`svc start` — artifact imports the whole
+   * `[HOOK] svc openmgr` â†’ `svc create` â†’ `svc start`, or with the service
+     already registered, `svc openmgr`/`svc start` â€” artifact imports the whole
      SCM set from `advapi32` (`OpenSCManagerW`, `CreateServiceW`,
      `StartServiceW`, `OpenServiceW`, `ControlService`, `DeleteService`).
-   * `[SYS] code integrity CHANGED … - DSE was turned OFF` … later
-     `… - DSE was turned back ON`. That pair is the proof that an unsigned
+   * `[SYS] code integrity CHANGED â€¦ - DSE was turned OFF` â€¦ later
+     `â€¦ - DSE was turned back ON`. That pair is the proof that an unsigned
      driver was loaded by this session.
-   * `[SVC] driver service registered: …` / `is now LOADED - the game started
+   * `[SVC] driver service registered: â€¦` / `is now LOADED - the game started
      it`, and `[KRNL] driver: hyperkd.sys`.
 
    If a run instead shows `currently LOADED (already up at first scan - the mod
    loads it during process startup)` with no `svc` lines and no DSE pair, the
-   race was lost for that launch — compare the timestamps of the first log line,
+   race was lost for that launch â€” compare the timestamps of the first log line,
    `hooks: IAT capture on` and the first `[SVC]` line before concluding anything
    about the protection.
 
@@ -144,16 +144,16 @@ by the script. Logs land in `<game>\logs\` (`.log` + `.csv`).
    service created through the SCM has its key written by `services.exe`, in
    that process; artifact.dll imports no registry API at all (its 9 `advapi32`
    imports are the SCM ones). The earlier expectation that the key write would
-   appear as `[HOOK] regkey … CREATED "\REGISTRY\MACHINE\SYSTEM\…"` was wrong.
+   appear as `[HOOK] regkey â€¦ CREATED "\REGISTRY\MACHINE\SYSTEM\â€¦"` was wrong.
    `regkey`/`regset`/`syst` and the `[FS]` `.sys` classifier therefore still have
    **no** in-game validation, and the module-IAT registry bridge is inert for
-   these three titles — keep it for modules that do import the registry pair, but
+   these three titles â€” keep it for modules that do import the registry pair, but
    do not count on it for item 1.
 
    Then run `tools\RunReport.ps1 -Dir <game>\logs`: its "Driver / service install
    trace" section states outright whether any of that was captured. Take the
    run's service key **name** from the log, not from this note.
-2. **Hidden-module PE-size fix — validated in a game** (PB0, 2026-11-16):
+2. **Hidden-module PE-size fix â€” validated in a game** (PB0, 2026-11-16):
    `hidden module: dse.dll @0x7FF9A81B0000 size 0x60000` and
    `hidden module: nvldumdx.dll @0x7FF9A8580000 size 0xD1000`, real
    `SizeOfImage` values rather than the old first-region `0x1000`. dse.dll is
@@ -162,34 +162,34 @@ by the script. Logs land in `<game>\logs\` (`.log` + `.csv`).
 3. **dse.dll detection is event-driven**: it is found only when caller
    attribution catches it calling something we instrument. **It never appeared at
    all in the 13:02/13:04 runs** (`hidden modules: 0` in all three, and no
-   `dse.dll loaded late` line) — because the hypervisor was already installed and
+   `dse.dll loaded late` line) â€” because the hypervisor was already installed and
    running, so the helper had nothing to do. The PB0 run at 12:38 did catch it
    (item 2) once, after the last heartbeat, so `HookLateModules` never got to
-   instrument it. A session where the protection actually acts — i.e. the
-   install in item 1 — is still what is needed to hook it and see its `wvm`/`svc`
+   instrument it. A session where the protection actually acts â€” i.e. the
+   install in item 1 â€” is still what is needed to hook it and see its `wvm`/`svc`
    calls.
 4. Optional polish: the `[SCAN] ldr: <list> cycles after N distinct entries`
-   lines repeat once per rescan (that is the list size changing, e.g. 90→150→
-   193→194 on PB0). Dedupe to first-report-plus-change if it becomes noisy.
+   lines repeat once per rescan (that is the list size changing, e.g. 90â†’150â†’
+   193â†’194 on PB0). Dedupe to first-report-plus-change if it becomes noisy.
 5. Optional RE: name artifact's VEH handler for PZ2/FFRS. It is *not* in the OS
    chain (private list), so it needs a read-only hunt for the protection's own
-   list — nothing yet.
-6. **PB0 dies the moment a hidden module is instrumented by address — root-caused
+   list â€” nothing yet.
+6. **PB0 dies the moment a hidden module is instrumented by address â€” root-caused
    and fixed** (2026-11-16). History: the 12:38 PB0 run ended abruptly with no
    `[CRASH]`, no crash file and no WER entry; the 13:02 run survived and I
    wrongly closed it as a one-off. The three launches at 14:14/14:15/14:16 settle
-   it: **all three** end on the same two lines —
+   it: **all three** end on the same two lines â€”
 
    ```
    [SCAN] hidden module: dse.dll @0x7FF980940000 size 0x60000 type 0x1000000 protect 0x2 ...
    [SCAN] binding census for dse.dll: 21 imports (0 unbound) in 19 descriptor(s) ...
    ```
 
-   — and nothing after, 3.7–5 s into the session, with the UE fatal-error dialog
+   â€” and nothing after, 3.7â€“5 s into the session, with the UE fatal-error dialog
    on screen. The surviving 13:02 run is the one that never detected dse.dll
    (`hidden modules: 0`). The next thing that code does is `HookOneModule` on the
    hidden module, i.e. **`VirtualProtect` + rewrite of dse.dll's import table by
-   address** — the one write this tool performs in another module's memory that
+   address** â€” the one write this tool performs in another module's memory that
    the owning module has not asked for. `HookHiddenModules` (default **false**)
    now stops there: a hidden module is detected, censused, reported and added to
    the caller table, but not repointed. Re-run and if PB0 survives to a normal
@@ -198,7 +198,7 @@ by the script. Logs land in `<game>\logs\` (`.log` + `.csv`).
    number to quote when judging whether a launch was in time at all.
 
    Related, and worth reading before the next attempt: the install itself is
-   visible from outside even when it is not visible in-process —
+   visible from outside even when it is not visible in-process â€”
    `tools\HostWatcher.log` from that session shows the whole cycle (see the
    kernel-agent bullet in Domain knowledge).
 
@@ -231,7 +231,7 @@ $c | Select-String 'cycles after|ldr survey|hidden module' # loader-list tamperi
 
 ## What this is
 
-One plain-C DLL (`GameConsole.c` → `GameConsole.dll`) loaded by a game's mod
+One plain-C DLL (`GameConsole.c` â†’ `GameConsole.dll`) loaded by a game's mod
 loader via `artifact.json` (`load_dlls`). It self-starts from `DllMain` (which
 only spawns a worker thread) and then logs and classifies everything that
 happens between the game/mod and the protection:
@@ -264,22 +264,22 @@ game-specific code, so the same build can be pointed at another title.
    `GetModuleHandleExW`/`GetModuleFileNameW`, no file I/O, no allocation.**
    Anything it needs is a plain read of a worker-maintained table (`g_crange` via
    `CallerRangeFor`/`Describe`/`DescribeModuleOf`) or is queued for the worker
-   (`NoteCallerAddr` → `ResolveCallerAddrs`, `HookAddPending` →
+   (`NoteCallerAddr` â†’ `ResolveCallerAddrs`, `HookAddPending` â†’
    `HookLateModules`). Not a style rule: a loader thread holding the loader lock
    while waiting on a thread inside one of our hooks deadlocks, and the game
-   **hangs** — which is exactly what happened when caller attribution still
+   **hangs** â€” which is exactly what happened when caller attribution still
    called `GetModuleHandleExW`.
 7. **Keep the game stable.** A crash or a hang is a failed run. The apphelp
    `SE_DllLoaded+0x3ae` `0xC0000409` fast-fail at process exit is cosmetic;
    nothing else is.
 8. **Do not instrument a protected exe's own imports by default.** Denuvo checks
    the EXE's import table, so repointing it makes the protection fail its own
-   tamper check — `Corrupt pak index detected` in Unreal titles. `HookExe`
+   tamper check â€” `Corrupt pak index detected` in Unreal titles. `HookExe`
    therefore defaults to **false**; the KERNELBASE interposition layer already
    covers calls that go through KERNELBASE without touching the protected image.
 9. **A protection hypervisor may be loaded while the CPUID bit is clear** (PZ2:
    `hyperkd.sys` loaded, `CPUID.1:ECX[31]=0`). Never conclude "no hypervisor"
-   from CPUID alone — report both and cross-reference the kernel module list.
+   from CPUID alone â€” report both and cross-reference the kernel module list.
 
 ## Build, deploy, validate
 
@@ -313,12 +313,12 @@ can be read in order. It:
 
 * loads `GameConsole.dll`,
 * installs two real `FF25` detours on `ntdll!NtOpenFile` / `ntdll!NtQueryInformationFile`
-  (slots and copy-prologue trampolines allocated within ±2 GB),
+  (slots and copy-prologue trampolines allocated within Â±2 GB),
 * registers a real VEH and UEH from the exe,
 * loads `version.dll` **after** the DLL (late-load retry path),
 * writes a registry value shaped like a driver `ImagePath`.
 
-The ini is part of the test — four switches have to be set, each for a different
+The ini is part of the test â€” four switches have to be set, each for a different
 assertion (do not "simplify" this back to an empty `HookModules`):
 
 ```
@@ -331,9 +331,9 @@ HoldOnCrash=false
 ```
 
 `GpaThunks=true` is the one real trade-off: it produces the
-`[HOOK] gpa <api> called N ... last caller ScanTest.exe+0x…` counters, but then
+`[HOOK] gpa <api> called N ... last caller ScanTest.exe+0xâ€¦` counters, but then
 the detours land on the thunk rather than the ntdll stub and the
-`ntdll#1!NtOpenFile -> …` line does **not** appear. A single run cannot show both.
+`ntdll#1!NtOpenFile -> â€¦` line does **not** appear. A single run cannot show both.
 Also delete `HKCU\Software\GameConsoleScanTest` before a run: `regkey` logs
 CREATED only, so on a second run the key already exists and `regset` appears
 alone.
@@ -359,10 +359,10 @@ A good run is `exit=0` (`progress.txt` ends `wmain: returning`) plus all of:
 
 The detour shows up as **four** anomalous entries (the Nt and Zw stubs share
 their code, so each detour shows twice, counted as "hooked outside ntdll"), and
-the `veh`/`ueh` lines are padded (`veh    add`, `ueh    set`). …plus **zero**
+the `veh`/`ueh` lines are padded (`veh    add`, `ueh    set`). â€¦plus **zero**
 `0x1B` (ESC) bytes in the log, one guard-page summary line, no `hidden module:`
-false positives (an on-demand DLL must not be mislabelled), no `<- 0x…`
-unattributed callers, and every `binding census … (tally sums to N)` line
+false positives (an on-demand DLL must not be mislabelled), no `<- 0xâ€¦`
+unattributed callers, and every `binding census â€¦ (tally sums to N)` line
 agreeing with the import count it reports. `[SYS]/[SVC]/[MEM]` depend on the box
 (`hvservice.sys` here); the rest do not.
 
@@ -381,9 +381,9 @@ Verified 2026-11-16 at `69a499b` on Win11 Pro x64 with VS 2022 Build Tools
 | module ranges / shadow naming | `RefreshModuleRanges`, `CensusDescribe` (`NAME#k @base+off`) |
 | IAT hook layer | `HookIatApi`/`HookIatName`/`HookIatByValue`, every `HkIat*`, `InstallIatHooks`, `HookOneModule`, `HookLateModules`, `HookAddPending`/`IsPendingHook`/`HookClearPending`, `InstallKernelbaseInterposition` |
 | KERNELBASE interposition | **20** `Nt*`: file/memory/thread/context probing + `NtCreateKey`/`NtSetValueKey`/`NtSetSystemInformation`; handlers `HkIatKb*`, `RegPathOfKey` (NtQueryKey), `HkIatKbNtSsi` |
-| registry bridge (module IAT) | `HkIatModNtCreateKey`/`HkIatModNtSetValueKey`/`HkIatRegCreateKeyExW`/`HkIatRegSetValueExW` + the shared `RegLogKeyEvent`/`RegLogValueEvent` loggers, so a module that imports the registry pair is covered even if it reaches a shadow `KERNELBASE#1`; thread-local `t_regLogged` snapshot in the `Reg*` handlers keeps it to one line when the KERNELBASE layer has already reported the call. **Inert for artifact.dll — it imports no registry API at all** (measured with `dumpbin /imports`), so a driver's service key is written by services.exe and cannot appear in the game's log |
+| registry bridge (module IAT) | `HkIatModNtCreateKey`/`HkIatModNtSetValueKey`/`HkIatRegCreateKeyExW`/`HkIatRegSetValueExW` + the shared `RegLogKeyEvent`/`RegLogValueEvent` loggers, so a module that imports the registry pair is covered even if it reaches a shadow `KERNELBASE#1`; thread-local `t_regLogged` snapshot in the `Reg*` handlers keeps it to one line when the KERNELBASE layer has already reported the call. **Inert for artifact.dll â€” it imports no registry API at all** (measured with `dumpbin /imports`), so a driver's service key is written by services.exe and cannot appear in the game's log |
 | direct-ntdll module probes | `HkIatModNtQit` / `HkIatModNtQvif` + `LogQit`, for the probes a module imports straight from ntdll (`NtQueryInformationThread`, `NtQueryVolumeInformationFile`) instead of through KERNELBASE |
-| returned data / written bytes | `BytesPreview` — bounded SEH-guarded hex of a caller buffer, used by `qip`/`qit` (what the OS answered), `qvmm` (decoded `MEMORY_BASIC_INFORMATION`), `rvm` (what was read out) and `wvm` (what was written in) |
+| returned data / written bytes | `BytesPreview` â€” bounded SEH-guarded hex of a caller buffer, used by `qip`/`qit` (what the OS answered), `qvmm` (decoded `MEMORY_BASIC_INFORMATION`), `rvm` (what was read out) and `wvm` (what was written in) |
 | census | `CensusBindings`, `CensusAllModules` |
 | surveys | `ScanNtdllHooks`(+`ScanNtdllImage`), `ShadowSurvey`/`DecodeExecPrologue`, `LdrSurvey`/`LdrWalkList` (per-list cycle detection) |
 | exception chain | `VehChainSurvey`, `VehFindLayout` (runtime layout + `RtlEncodePointer`), `VehHandlerOf`, `VehDescribe` |
@@ -396,10 +396,10 @@ Verified 2026-11-16 at `69a499b` on Win11 Pro x64 with VS 2022 Build Tools
 * console: `ConsoleVisible`, `AllocConsole` (false = log-file-only), `ConsoleTitle`, `ConsoleCols`, `ConsoleRows`, `ShowTimestamps`, `ShowColors`, `ShowLegend`, `ShowStartupInfo`
 * saving/log: `SaveLogFile`, `LogDirectory`, `SaveTaggedLines`, `SaveRawLines`, `WriteTraceFile`, `WriteCrashFile`, `CsvExport`
 * capture: `CaptureOutputDebugString`, `RedirectCrt`, `RedirectStdHandles`, `EnableCrashHandler`, `HoldOnCrash` (**freezes** the process on an unhandled crash; shipped ini sets false)
-* show gates: one `Show_*` per tag group; `Show_System` gates `[SYS]/[KRNL]/[SVC]`, `[EH]` rides on `Show_Exceptions`, `Show_Hooks` gates `[HOOK]`, and `[SCAN]` has no switch of its own — `CategoryOn` falls through to `Show_LogFiles` for any tag it does not recognise
+* show gates: one `Show_*` per tag group; `Show_System` gates `[SYS]/[KRNL]/[SVC]`, `[EH]` rides on `Show_Exceptions`, `Show_Hooks` gates `[HOOK]`, and `[SCAN]` has no switch of its own â€” `CategoryOn` falls through to `Show_LogFiles` for any tag it does not recognise
 * hooks: `HookApis`, `HookFileReads`, `HookFileWrites`, `HookMemPatches`, `HookOnlyGameModules`, `HookLegacyNtdll`, `HookModules`, `HookExe` (false), `HookHiddenModules` (false), `MaxHookReports`, `GpaThunks`
 * surveys: `CensusAll`, `CensusAllMax`, `ScanShadow`, `ShadowDetailMax`, `ScanLdr`, `ScanOtherHooks`, `ScanOtherHooksMax`, `ScanEh`, `ScanServices`, `ScanDrivers`, `ServiceWatch`, `ServiceWatchAll`, `WatchSharedData`, `MemGuardScan`, `MemGuardAll`
-* the remaining groups (modules, log tailing, exceptions, threads, memory, network, files, heartbeat, ODS) live in `README.md`'s settings table with their defaults — keep that table in sync with `Opts[]`
+* the remaining groups (modules, log tailing, exceptions, threads, memory, network, files, heartbeat, ODS) live in `README.md`'s settings table with their defaults â€” keep that table in sync with `Opts[]`
 
 ## Output tags and hook kinds
 
@@ -407,7 +407,7 @@ Tags: `[INFO]` `[MOD]` `[THR]` `[MEM]` `[NET]` `[FS]` `[HB]` `[SD]` `[ODS]`
 `[EXC]` `[CRASH]` `[EH]` `[HOOK]` `[SCAN]` `[SYS]` `[KRNL]` `[SVC]` `[console]`
 `[<file.log>]`, plus `[raw]` for the game's own console output.
 
-Hook kinds on `[HOOK]` lines: `create/open/read/write/…` (file+memory),
+Hook kinds on `[HOOK]` lines: `create/open/read/write/â€¦` (file+memory),
 `qip/sit/sip/qit/qit(iat)/qvif/setctx/getctx/cthex/avm/rvm/wvm/qvmm/openthr`
 (anti-debug, fingerprinting and mutual probing), `veh add|remove`,
 `veh add continue`, `ueh set`, `regkey` (CREATED only), `regset`, `syst`
@@ -420,7 +420,7 @@ Data now appears on the probe lines, not just the call: `qip`/`qit` append the
 first 16 bytes the OS returned, `qvmm` decodes the returned
 `MEMORY_BASIC_INFORMATION` (`base/size/state/prot/type`), `rvm` shows the bytes
 read out and `wvm` the bytes written in. When adding a hook, prefer reporting the
-*returned/transferred data* for queries and writes — "what came back" and "what
+*returned/transferred data* for queries and writes â€” "what came back" and "what
 was patched" is the point of the tool, and a bare pointer is not evidence.
 
 ## Domain knowledge from real runs (observational)
@@ -441,17 +441,17 @@ was patched" is the point of the tool, and a bare pointer is not evidence.
   reaches the head, so the tool reports every list per rescan:
   `[SCAN] ldr: load-order list cycles after 88 distinct entries - loader list
   relinked (not normal)` and `ldr survey: load-order 88 / memory-order 88 /
-  init-order 87 distinct entries, … 24 pointing at non-image memory`. FFRS, same
-  code: `load-order 57 / memory-order 57 / init-order 56 …, 15 pointing at
+  init-order 87 distinct entries, â€¦ 24 pointing at non-image memory`. FFRS, same
+  code: `load-order 57 / memory-order 57 / init-order 56 â€¦, 15 pointing at
   non-image memory`, no cycles. Counts grow/shrink across a session
-  (PB0: 88→150→193→194). This is why the old fixed 512-entry cap only ever saw
+  (PB0: 88â†’150â†’193â†’194). This is why the old fixed 512-entry cap only ever saw
   ~70 modules.
 * **`artifact.dll`** is the mod: it carries the literal string `hyperkd`, forwards
   `ntdll#1!LdrGetDllHandle` and `RtlAddVectoredExceptionHandler` to itself (newer
   builds), and starts the driver through the SCM. `apphelp.dll` takes
   `Nt*File`/`ZwSetValueKey` forwards (AppCompat shim).
   Its import surface was dumped for PB0 (1.28 MB image, 14 descriptors, 134
-  imports) — worth knowing before hooking anything:
+  imports) â€” worth knowing before hooking anything:
   * `advapi32` (9) is **the whole SCM path**: `OpenSCManagerW`, `CreateServiceW`,
     `StartServiceW`, `OpenServiceW`, `ControlService`, `DeleteService`,
     `CloseServiceHandle`, `OpenProcessToken`, `GetTokenInformation`.
@@ -464,17 +464,17 @@ was patched" is the point of the tool, and a bare pointer is not evidence.
     `CopyFileExW`, `QueryDosDeviceW`, `GetFinalPathNameByHandleW`,
     `SetFileInformationByHandle`, `GetModuleHandleExW`, `CreateProcessW`,
     `ExitProcess`, `TerminateProcess`.
-  * **No `Reg*` and no `Nt*Key` at all** — that is why the registry bridge is
+  * **No `Reg*` and no `Nt*Key` at all** â€” that is why the registry bridge is
     inert here, and why a service key write cannot come from the game process.
 * **`dse.dll`** is a hidden helper: in no toolhelp list and no PEB loader list,
   resolvable only by address; it does cross-process `NtWriteVirtualMemory` (2
-  writes per target into ~20 processes). Detection is **event-driven** — it shows
+  writes per target into ~20 processes). Detection is **event-driven** â€” it shows
   up only when it calls something we instrument.
   Its job (user-confirmed, and consistent with its imports): **switch DSE off**
   so the unsigned `hyperkd.sys` can start, wait for the hypervisor service, then
-  **switch DSE back on**. It imports only 21 functions — `advapi32!FreeSid`,
+  **switch DSE back on**. It imports only 21 functions â€” `advapi32!FreeSid`,
   `Cabinet!FDICopy`, `dbghelp!SymFromNameW`, `KERNEL32!LoadLibraryA`/
-  `GetProcAddress`/`VirtualProtect`, the rest CRT — i.e. a self-unpacking stub
+  `GetProcAddress`/`VirtualProtect`, the rest CRT â€” i.e. a self-unpacking stub
   that resolves every ntdll call at run time. That is why hooking its IAT by name
   finds nothing useful, and why the **Code Integrity state** is the reliable
   observable of its work.
@@ -485,51 +485,51 @@ was patched" is the point of the tool, and a bare pointer is not evidence.
   through `CreateServiceW` + `StartServiceW` + registry (`ImagePath`/`Type`/`Start`).
   Loaded without the CPUID hypervisor bit (see hard rule 9).
 * **The whole install/teardown cycle, observed from outside** (HostWatcher, PB0
-  2026-11-16 — three launches). Each launch, in order:
+  2026-11-16 â€” three launches). Each launch, in order:
   * three kernel images appear together from `<game>\Artifact_Intel\`:
-    `hyperkd.sys` (0x7000), `hyperhv.dll` (0x8A000), `hyperevade.dll` (0x7000) —
+    `hyperkd.sys` (0x7000), `hyperhv.dll` (0x8A000), `hyperevade.dll` (0x7000) â€”
     note two of the three carry a `.dll` name while being kernel modules;
-  * service `artifact` goes `START_PENDING` → `RUNNING` about 0.6 s later
+  * service `artifact` goes `START_PENDING` â†’ `RUNNING` about 0.6 s later
     (ImagePath is `hyperkd.sys`, so the key name still says nothing about the
     file);
   * **DSE is taken down by loading a vulnerable signed driver, not by a CI API**:
     `RTCORE64.SYS` (0x6000) appears from
-    `%TEMP%\dsedll\RTCore64.sys` — MSI Afterburner's known-vulnerable driver, the
-    classic BYOVD route to disable driver signature enforcement — and is gone
+    `%TEMP%\dsedll\RTCore64.sys` â€” MSI Afterburner's known-vulnerable driver, the
+    classic BYOVD route to disable driver signature enforcement â€” and is gone
     again within ~0.6 s (it is only caught when the 500 ms poll lands inside that
     window, which is why it shows in one cycle out of three);
-  * on exit: the three images unload, the service goes `RUNNING` → `STOPPED`, and
-    the `artifact` key is **removed** ~0.7 s later (`sc query artifact` → 1060),
+  * on exit: the three images unload, the service goes `RUNNING` â†’ `STOPPED`, and
+    the `artifact` key is **removed** ~0.7 s later (`sc query artifact` â†’ 1060),
     so a box that has run a title and then been left alone has no service and no
     loaded driver.
-  * Cycle-to-cycle timings from the same log: install 14:16:08.556 → service
-    RUNNING 14:16:09.210, teardown 14:16:33.338 → key gone 14:16:33.994.
-* **The install happens before GameConsole's worker starts** — that is why no run
+  * Cycle-to-cycle timings from the same log: install 14:16:08.556 â†’ service
+    RUNNING 14:16:09.210, teardown 14:16:33.338 â†’ key gone 14:16:33.994.
+* **The install happens before GameConsole's worker starts** â€” that is why no run
   has ever shown `svc create` from inside. In the 14:16 launch the driver was up
   at 14:16:08.5 while the game's first log line is 14:16:12.050, i.e. **3.5 s
   later**, and `GetModuleHandleW(L"dse.dll")` still returned NULL at 12.066 even
   though dse had already done the DSE work. Two readings are possible (our worker
   was starved, or the loader loads `load_dlls` after the driver is up); the new
-  `process created … this worker started +N ms later` line answers it on the next
+  `process created â€¦ this worker started +N ms later` line answers it on the next
   run. Either way, an in-process capture of the SCM calls needs `gameconsole.dll`
   earlier in `artifact.json`, and until then the watcher is the instrument for
   the install.
-* **dse.dll calls back into us ~4 s after the game starts** (~7–8 s after the
+* **dse.dll calls back into us ~4 s after the game starts** (~7â€“8 s after the
   service started): in all three launches its first hooked-API call arrived at
   3.7/4.0/4.4 s and was what got it detected. That call itself is invisible as a
-  `[HOOK]` line because the hook path can only queue an address it cannot name —
+  `[HOOK]` line because the hook path can only queue an address it cannot name â€”
   which is exactly how the hidden module is found a moment later.
 * **The protection's VEH handler is only visible in PB0.** PB0's chain:
-  `[EH] veh chain[0] (first): GameConsole.dll+… [GameConsole]` then
+  `[EH] veh chain[0] (first): GameConsole.dll+â€¦ [GameConsole]` then
   `[EH] veh chain[1] (last): artifact.dll+0x1211A`. PZ2/FFRS show **only** our
-  handler — the newer artifact keeps a private handler list behind its
+  handler â€” the newer artifact keeps a private handler list behind its
   `RtlAddVectoredExceptionHandler` proxy. No `veh add` line appears in any run
   because artifact arms before our hooks exist and/or goes through its shadow
   `ntdll#1` export table.
 * **Anti-debug**: PB0 and PZ2 run a self-probe single-step loop (byte-identical:
-  `Dr6=FFFF0FF0`, `Dr7=0x440`, `rip=Dr3=…`), and probe `ProcessDebugPort` (0xC),
+  `Dr6=FFFF0FF0`, `Dr7=0x440`, `rip=Dr3=â€¦`), and probe `ProcessDebugPort` (0xC),
   `AmILastThread` (12), `ThreadHideFromDebugger` (0x11) etc. FFRS shows none of
-  that; its KUSER_SHARED_DATA mailbox stays `…37133713`.
+  that; its KUSER_SHARED_DATA mailbox stays `â€¦37133713`.
 * **The module-level ntdll probe hooks are installed but still unexercised**
   (2026-11-16 13:02/13:04). PB0 and PZ2 log
   `(iat) NtQueryInformationThread hooked in artifact.dll` and the same for
@@ -537,20 +537,20 @@ was patched" is the point of the tool, and a bare pointer is not evidence.
   does not import them at all. After that nothing arrived through those two
   slots: every `qit` line named **PBZ.exe** as the caller (so it came through the
   KERNELBASE layer, class 30 = thread-group information, returning
-  `FF FF 00 00 …`), and `qvif` never appeared once. So artifact either calls
+  `FF FF 00 00 â€¦`), and `qvif` never appeared once. So artifact either calls
   those APIs only on a path these sessions did not take (licence/bind at first
   run) or has cached the pointers in its own table. Do not read "hooked in
   artifact.dll" as "we see artifact's volume queries"; grep `qit(iat)`/`qvif` in
   the log to see whether the module's own slot ever executed.
 * **Not the protection**: FFRS's `steam_api64.dll+0x9C381B` throws `0xE06D7363`
-  ~100–200× per run.
+  ~100â€“200Ã— per run.
 
 ## Windows quirks this code accounts for
 
 * **No reliable documented user-mode hypervisor query**: `tools/SysInfoProbe.c`
-  swept `NtQuerySystemInformation` 0x00–0x120 and none returns an unambiguous
+  swept `NtQuerySystemInformation` 0x00â€“0x120 and none returns an unambiguous
   hypervisor structure (the ones that succeed are zeroed with no hypervisor
-  armed). Presence is derived from CPUID **plus** the kernel module list — do not
+  armed). Presence is derived from CPUID **plus** the kernel module list â€” do not
   "fix" that by guessing a class number.
 * Kernel base addresses are **redacted** for ordinary callers via
   `SystemModuleInformation`; `[KRNL]` reports names/sizes/load order and says so.
@@ -558,7 +558,7 @@ was patched" is the point of the tool, and a bare pointer is not evidence.
   (`0xC0000022`) to a game process, so installed drivers come from
   `HKLM\SYSTEM\CurrentControlSet\Services` (works unelevated).
 * A VEH node stores its handler as `RtlEncodePointer(handler)` on current builds;
-  the layout and encoding are discovered at runtime by `VehFindLayout` — never
+  the layout and encoding are discovered at runtime by `VehFindLayout` â€” never
   hard-code offsets.
 * `winternl.h`/`UNICODE_STRING` are unavailable under `WIN32_LEAN_AND_MEAN`;
   declare the equivalents locally (`GC_UNI`, `GC_USTR`).
@@ -569,17 +569,17 @@ was patched" is the point of the tool, and a bare pointer is not evidence.
 ## Gotchas already paid for
 
 * Empty `HookModules` means **KERNELBASE interposition for all callers**, not "no
-  hooks"; `HookExe` (off) additionally instruments the exe's own IAT — which is
+  hooks"; `HookExe` (off) additionally instruments the exe's own IAT â€” which is
   what trips Denuvo's tamper check.
-* Instrumenting a protected EXE ⇒ `Corrupt pak index detected` (PB0 + FFRS).
+* Instrumenting a protected EXE â‡’ `Corrupt pak index detected` (PB0 + FFRS).
   That is why `HookExe=false`.
-* Loader APIs in the hook path ⇒ the game hangs at startup (PZ2). See hard rule 6.
+* Loader APIs in the hook path â‡’ the game hangs at startup (PZ2). See hard rule 6.
 * Caller naming must not use the loader; unresolved callers are queued by
   address and resolved on the worker, which also refreshes the table **before**
   deciding hidden-or-not (an on-demand DLL was once mislabelled, `NSI.dll`).
 * A mod's helper DLL loads *after* this DLL: unresolved hook targets are logged
   and retried (every ~40 ms during the 3 s startup window, then once a second).
-  A hidden module is **not** hooked by default — rewriting the import table of a
+  A hidden module is **not** hooked by default â€” rewriting the import table of a
   module that hides itself from the loader killed PB0 at that instant, every
   launch that reached it (item 6). Report and census it; `HookHiddenModules=true`
   only when a dying session is acceptable.
@@ -588,7 +588,7 @@ was patched" is the point of the tool, and a bare pointer is not evidence.
   tampering and leave it alone. The KERNELBASE layer still sees its calls.
 * `HoldOnCrash=true` + an unhandled crash = a process frozen in `Sleep(INFINITE)`
   ("held open"), which looks exactly like a hang. Set it to false when testing.
-* A service key name is not a driver file name (service `artifact` →
+* A service key name is not a driver file name (service `artifact` â†’
   `hyperkd.sys`); loaded-state checks must use the ImagePath basename.
 * The guard-page scan must stay summarised (it once produced 481 lines/run).
 * The shadow survey needs a **per-module** detail quota (`ShadowDetailMax`); a
@@ -603,8 +603,8 @@ was patched" is the point of the tool, and a bare pointer is not evidence.
   user-facing description and must describe every switch, tag and hook kind.
   The settings section of `README.md` carries a full table of all `Opts[]`
   entries (key, default, meaning), so adding a setting means adding a row there
-  too — the table is the check that no switch is undocumented.
-* Build outputs are gitignored — the repo is the source of the tool, not the
+  too â€” the table is the check that no switch is undocumented.
+* Build outputs are gitignored â€” the repo is the source of the tool, not the
   deployed artifact. After changing behaviour: `build.cmd`, run ScanTest, then
   commit; if a game was involved, say which title and paste the lines that prove
   it (the log is the evidence).
