@@ -17,6 +17,20 @@
 // hooks and its worker thread are all in place before the first instruction of
 // the game executes.
 //
+// VERDICT ON DENUVO TITLES (PB0, 2026-11-23): injection works mechanically
+// (LoadLibraryW returns a base at +0.3 s) but the game dies on Denuvo's
+// anti-tamper ~30 s in, exit 0xFFFFFFFF, no WER entry, no crash dump - with
+// HookApis=false, i.e. ZERO IAT writes. So the trigger is the injection timing
+// itself, not what the DLL does afterwards; a DLL mapped before instruction
+// zero is detected and killed. The loader path (+4.4 s, after the protection's
+// own startup) has never tripped it. Also measured here: the worker still
+// starts +3926 ms in even when the DLL is mapped at t=0, because the worker
+// thread waits on the loader lock, which the main thread holds through the
+// whole mod chain - dse.dll's DllMain alone is ~3 s of dbghelp PDB resolution.
+// The +4.4 s "loader delay" on ordinary launches is the same serialization,
+// not the loader staging load_dlls late. Use the external HostWatcher and the
+// protection's own dse.ini logging=true for the install window instead.
+//
 // Build:
 //   cl /nologo /O2 /W3 EarlyLoad.c /Fe:EarlyLoad.exe
 //
@@ -98,7 +112,7 @@ int wmain(int argc, wchar_t** argv)
     {
         WCHAR* slash;
         wcsncpy_s(exeDir, _countof(exeDir), cmd, _TRUNCATE);
-        if (exeDir[0] == L'"') { memmove(exeDir, exeDir + 1, wcslen(exeDir)); }
+        if (exeDir[0] == L'"') { memmove(exeDir, exeDir + 1, (wcslen(exeDir) + 1) * sizeof(WCHAR)); }
         slash = wcsrchr(exeDir, L'\\');
         if (slash) *slash = 0;
         _snwprintf_s(dll, _countof(dll), _TRUNCATE, L"%s\\GameConsole.dll", exeDir);
