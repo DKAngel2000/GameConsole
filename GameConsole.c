@@ -5730,13 +5730,19 @@ typedef struct {
 #define MAX_LDR 4096
 static ULONG_PTR g_ldrSeen[MAX_LDR]; static int g_nLdrSeen = 0;
 static int g_ldrSummaryDone = 0;
+// The "cycles after N distinct entries" lines used to repeat once per rescan
+// (the relinked lists are re-walked every heartbeat). Report the first cycle,
+// then only on change, counting the unchanged rescans so the suppression is
+// itself reported on the next change (hard rule 3: never filter silently).
+static int g_ldrCycLast[3] = { -1, -1, -1 };
+static int g_ldrCycSkipped[3] = { 0, 0, 0 };
 
 static ULONG_PTR g_ldrTb[1024]; static int g_nLdrTb = 0;
 
 // Returns the number of distinct entries walked. ghost/nonimg accumulate.
 // linkOff is the offset of the list links inside LDR_DATA_TABLE_ENTRY: 0x00
 // (load order), 0x10 (memory order), 0x20 (initialisation order).
-static int LdrWalkList(LIST_ENTRY* head, int linkOff, const WCHAR* which, int* ghost, int* nonimg)
+static int LdrWalkList(LIST_ENTRY* head, int linkOff, const WCHAR* which, int slot, int* ghost, int* nonimg)
 {
     static LIST_ENTRY* vis[MAX_LDR];
     int nv = 0, total = 0, guard = 0, cycle = 0, i;
@@ -5811,11 +5817,36 @@ static int LdrWalkList(LIST_ENTRY* head, int linkOff, const WCHAR* which, int* g
     }
     if (cycle)
     {
+        if (total == g_ldrCycLast[slot])
+        {
+            g_ldrCycSkipped[slot]++;          // unchanged since the last report
+        }
+        else
+        {
+            WCHAR line[400];
+            if (g_ldrCycLast[slot] >= 0 && g_ldrCycSkipped[slot] > 0)
+                StringCchPrintfW(line, 400, L"ldr: %s list cycles after %d distinct entries (was %d, %d unchanged rescan(s) not repeated) - loader list relinked (not normal)",
+                                 which, total, g_ldrCycLast[slot], g_ldrCycSkipped[slot]);
+            else
+                StringCchPrintfW(line, 400, L"ldr: %s list cycles after %d distinct entries - loader list relinked (not normal)",
+                                 which, total);
+            Write(L"[SCAN]", line);
+            CsvRow(L"ldr-cycle", which, line, L"");
+            g_ldrCycLast[slot] = total;
+            g_ldrCycSkipped[slot] = 0;
+        }
+    }
+    else if (g_ldrCycLast[slot] >= 0)
+    {
+        // A list that used to cycle and now walks to the head is a state
+        // change in itself - say so, then rearm for a future relink.
         WCHAR line[400];
-        StringCchPrintfW(line, 400, L"ldr: %s list cycles after %d distinct entries - loader list relinked (not normal)",
+        StringCchPrintfW(line, 400, L"ldr: %s list no longer cycles (%d distinct entries) - the relink is gone",
                          which, total);
         Write(L"[SCAN]", line);
         CsvRow(L"ldr-cycle", which, line, L"");
+        g_ldrCycLast[slot] = -1;
+        g_ldrCycSkipped[slot] = 0;
     }
     return total;
 }
@@ -5843,9 +5874,9 @@ static void LdrSurvey(int first)
     __try { ldr = *(BYTE**)(peb + 0x18); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return; }
     if (!ldr) return;
-    nLoad = LdrWalkList((LIST_ENTRY*)(ldr + 0x10), 0x00, L"load-order", &ghost, &nonimg);
-    nMem  = LdrWalkList((LIST_ENTRY*)(ldr + 0x20), 0x10, L"memory-order", &ghost, &nonimg);
-    nInit = LdrWalkList((LIST_ENTRY*)(ldr + 0x30), 0x20, L"init-order", &ghost, &nonimg);
+    nLoad = LdrWalkList((LIST_ENTRY*)(ldr + 0x10), 0x00, L"load-order", 0, &ghost, &nonimg);
+    nMem  = LdrWalkList((LIST_ENTRY*)(ldr + 0x20), 0x10, L"memory-order", 1, &ghost, &nonimg);
+    nInit = LdrWalkList((LIST_ENTRY*)(ldr + 0x30), 0x20, L"init-order", 2, &ghost, &nonimg);
     if (!g_ldrSummaryDone && (nLoad || nMem || nInit || ghost || nonimg))
     {
         WCHAR line[400];

@@ -16,12 +16,12 @@ PB0 `H:\Games\Phantasy Blade 0\platform\steam\PBZ.exe`, PZ2
 MSVC via VS 18 Community (`vcvars64.bat` at
 `C:\Program Files\Microsoft Visual Studio\18\Community\...`).
 
-**Repo state** `main` = `8fe51a1`, pushed (b0dfe3c = wide wvm preview;
-8fe51a1 = EarlyLoad quoted-path fix). Deployed `GameConsole.dll` is `514A8D5E`
-(351,232 B), built from the `b0dfe3c` source, hash-verified in all three game
-folders; ScanTest green on this box at that build (exit=0, 0 ESC, 0
-unattributed). Compare source commits across machines, never hashes across
-builds.
+**Repo state** `main` = the 23/24 Nov tip, pushed. Commits, newest first:
+ldr-dedupe + `tools\vehname.ps1`; `8fe51a1` (EarlyLoad quoted-path fix);
+`b0dfe3c` (wide wvm preview). Deployed `GameConsole.dll` is `2FB62F3A`
+(351,744 B) — the ldr-dedupe build, hash-verified in all three game folders;
+ScanTest green on this box at that build (exit=0, 0 ESC, 0 unattributed).
+Compare source commits across machines, never hashes across builds.
 
 **HVCI gate (this box's 10-second silent death).** With HVCI/VBS on, PB0 exits
 ~10 s in with no protection activity, no logs and no WER. dse's readme says it
@@ -83,10 +83,36 @@ off only if the user asks. Evidence transcripts on this box:
 `tools\HostWatcher.run{A-20261123,A2-ok-2202,B-2211,C-2216,D-2302}.log`,
 `tools\EarlyLoad.runD.log`, game logs under each title's `logs\`.
 
+**Optional backlog, done 23/24 Nov (both from the 16 Nov list):**
+
+* **ldr-line dedupe (item 4).** The `ldr: <list> cycles after N distinct
+  entries` lines used to repeat once per rescan. `LdrWalkList` now takes a
+  per-list slot, reports the first cycle, then only on change, and counts the
+  unchanged rescans: the next change reads `... (was 88, 3 unchanged rescan(s)
+  not repeated) ...`. A list that stops cycling is reported too (`no longer
+  cycles ... - the relink is gone`) so the suppression can never hide a state
+  change. ScanTest green; **in-game proof still pending** — the build is
+  deployed, so the next ordinary PB0/PZ2 launch either shows the deduped lines
+  or the run is the proof, no special setup.
+* **artifact's VEH handler named (item 5), as far as statics allow.** PB0's
+  OS-chain handler `artifact.dll+0x1211A` (same RVA in all four 23 Nov runs):
+  in `.text`, function starts at that RVA (`41 53 55 9C` = push r11/push
+  rbp/pushfq) and immediately loads two imm64 obfuscation keys — mutated
+  code, no symbol. The on-disk export directory is deliberately corrupted
+  (flags=0, timestamp 0xFFFFFFFF, garbage names), so nothing static can name
+  it. Its behavioral identity, from run A: the only first-chance exceptions
+  the protection raises are exactly 137 `0x80000004 single step` lines
+  (rip=Dr3, Dr6=FFFF0FF0, Dr7=0x440) — the handler is the filter that services
+  the protection's single-step self-probe loop. New read-only tool:
+  `tools\vehname.ps1 -Path <dll> -Rva <n> [-AlsoSearch <dll2>]` (section,
+  export-table honesty, probable function start, cross-image byte search).
+  **PZ2's private-list twin does not match by bytes** (each build re-keys its
+  obfuscation), so locating it still needs a disassembler pass over PZ2's
+  RtlAddVectoredExceptionHandler proxy — the one RE thread left open.
+
 **What is left:** nothing blocking. The tool is a validated observer under the
-sanctioned loader path on this box. Optional polish from the 16 Nov list (ldr
-line dedupe, naming artifact's private VEH) remains optional; the 16 Nov
-next-steps below are superseded by the verdict above.
+sanctioned loader path on this box. The 16 Nov next-steps below are superseded
+by the verdict above.
 
 **Repository** `https://github.com/DKAngel2000/GameConsole` (branch `main`,
 remote `origin`). Source-only: `*.dll`, `*.exe`, `*.obj`, `logs/`, `*.log`,
