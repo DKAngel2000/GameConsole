@@ -6,6 +6,88 @@ the hard way on real Denuvo titles.
 
 ## Status / handover
 
+### SESSION HANDOVER — 2026-11-23. Read this block first; it supersedes the 16 Nov block below.
+
+**Machine swap done, and the research question is answered.** This box: Win11,
+titles on `H:` (**not** `F:` — every path in the 16 Nov block below is stale):
+PB0 `H:\Games\Phantasy Blade 0\platform\steam\PBZ.exe`, PZ2
+`H:\Games\Planet Zoo 2\PlanetZoo2.exe`, FFRS
+`H:\Games\FINAL FANTASY RESONANCE\FFRS\Binaries\Win64\FFRS-Win64-Shipping.exe`.
+MSVC via VS 18 Community (`vcvars64.bat` at
+`C:\Program Files\Microsoft Visual Studio\18\Community\...`).
+
+**Repo state** `main` = `8fe51a1`, pushed (b0dfe3c = wide wvm preview;
+8fe51a1 = EarlyLoad quoted-path fix). Deployed `GameConsole.dll` is `514A8D5E`
+(351,232 B), built from the `b0dfe3c` source, hash-verified in all three game
+folders; ScanTest green on this box at that build (exit=0, 0 ESC, 0
+unattributed). Compare source commits across machines, never hashes across
+builds.
+
+**HVCI gate (this box's 10-second silent death).** With HVCI/VBS on, PB0 exits
+~10 s in with no protection activity, no logs and no WER. dse's readme says it
+needs HVCI/VBS off; `Win32_DeviceGuard` now reads VBS=0 / HVCI Enabled=0 and
+runs go clean. Note the trap: `[SYS] code integrity` still shows the
+`hvci-kmci` bit set (`0x0000C301`) with HVCI *actually off* — that bit is
+configured, not armed; don't read it as HVCI being on.
+
+**Four PB0 runs, all with HostWatcher + dse logging (`dse.ini logging=true`):**
+
+* Run A (22:02, loader path): clean 75 s, normal exit, `worker started
+  +4611 ms` — the baseline, and first clean in-game run of this source.
+* Run B (22:11): `dse-dll.log` (dse's own log, written next to dse.dll) is the
+  whole install from inside the game process: extract `RTCore64.sys` to
+  `%TEMP%\dsedll\`, BYOVD patch `SeCiCallbacks` → `ZwFlushInstructionCache`
+  (original saved to registry), DSE restored when the game's first window
+  appears (+8 s), watchdog only handles the exit path. **The `[SYS] code
+  integrity` DSE pair can never fire** — dse patches the CI callback, not CI
+  policy; our sampler inside the disabled window still logged "DSE on", and so
+  did the watcher's 200 ms poll. The observables of the toggle are dse's log,
+  its registry patch state and the RTCore64 mtime — nothing else.
+* Run C (22:16, wide-preview fix): clean; captured dse's injected blob. It
+  writes 0x11D8 bytes into ~6–10 processes (2 writes per target): the blob,
+  then an 8-byte pointer at a fixed per-process slot ending `0x2D8` holding
+  the blob's base. Blob layout: 520 zero bytes, then `D8 11 00 00` (own
+  length), magic `0xAC0DEDAB`, version 1, machine `0x8664`, four u32 offsets
+  inside ntdll.dll's size range, tail `0x821 / 1 / 16×0x11`. A structured
+  descriptor, not code.
+* Run D (23:02, EarlyLoad t=0 with `HookApis=false` — zero IAT writes):
+  injection succeeded (`LoadLibraryW returned 0xE7690000`), game died on
+  Denuvo's anti-tamper page after 30 s. **Decisive: the injection itself is
+  what Denuvo detects; writes are excluded.** The 21:11 open question is
+  closed.
+
+**Loader-lock starvation (mechanism behind "dse locks out loading").** Even at
+t=0, run D's worker logged `+3926 ms`. DllMain only spawns the worker; the
+worker's `LdrInitializeThunk` queues on the **loader lock**, which the main
+thread — resumed microseconds later — holds for its whole init and mod chain
+(winmm → artifact.json → GameConsole → dse ≈ 3 s of dbghelp PDB work under
+the lock → coldloader). The worker runs only when that chain finishes. So a
+t=0-injected worker would arrive *after* the install even if anti-tamper
+let it live.
+
+**Verdict on the old item 1 (capture the install in-process): dead end, and
+now a documented negative.** Two independent walls: anti-tamper kills t=0
+injection regardless of writes, and loader-lock starvation would delay the
+worker past the install anyway. The sanctioned loader path delivers the DLL at
++4.4 s, after the install (+1.3–3.2 s). The install is instead fully
+instrumented by: dse's own `dse-dll.log`, `tools\HostWatcher.exe` (external:
+DSE poll, kernel images, service lifecycle, helper processes, teardown), and
+the in-process `wvm`/`avm` capture of dse's cross-process writes. PZ2/FFRS run
+the same artifact family — expect the same two walls; do not burn attempts.
+
+**State to leave the box in** (currently true): all three `GameConsole.ini`
+on the sanctioned recipe (`HookApis=true`, `HookExe=false`,
+`HookHiddenModules=false`, `HookDelayMs=0`); PB0's `dse.ini` has
+`logging=true` deliberately — `dse-dll.log` is now the install record; turn it
+off only if the user asks. Evidence transcripts on this box:
+`tools\HostWatcher.run{A-20261123,A2-ok-2202,B-2211,C-2216,D-2302}.log`,
+`tools\EarlyLoad.runD.log`, game logs under each title's `logs\`.
+
+**What is left:** nothing blocking. The tool is a validated observer under the
+sanctioned loader path on this box. Optional polish from the 16 Nov list (ldr
+line dedupe, naming artifact's private VEH) remains optional; the 16 Nov
+next-steps below are superseded by the verdict above.
+
 **Repository** `https://github.com/DKAngel2000/GameConsole` (branch `main`,
 remote `origin`). Source-only: `*.dll`, `*.exe`, `*.obj`, `logs/`, `*.log`,
 `*.csv` are gitignored, so the built DLL is *not* in the repo — run `build.cmd`.
@@ -47,7 +129,7 @@ this line whenever you validate a change, so the next session knows what the las
 *proven* state was (`git log` is the tip; this line is about evidence, not
 recency).
 
-### SESSION HANDOVER — 2026-11-16 late evening. Read this block first.
+### SESSION HANDOVER — 2026-11-16 late evening. (Superseded by the 23 Nov block above; kept for its rules, quirks and domain knowledge.)
 
 **The guard IS now validated in a game** (this supersedes the paragraph above):
 the 17:22/17:23/17:25 runs of PB0/PZ2/FFRS all went to a normal exit on the
