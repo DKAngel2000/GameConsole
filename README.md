@@ -163,7 +163,8 @@ repo overrides four of them: `HoldOnCrash=false`, `HookModules=artifact.dll,dse.
 | `HookLegacyNtdll` | `false` | Also allow legacy ntdll stub patching when `HookModules` is empty. **Dangerous**: races other mods' ntdll hooks |
 | `HookModules` | *(empty)* | Comma-separated module names whose IAT is instrumented, e.g. `artifact.dll`. Empty = no per-module IAT hooks, but the KERNELBASE interposition layer is still installed and logs all callers |
 | `HookExe` | `false` | Also instrument the game executable's own import table. OFF by default: a protected exe checks its own imports, and repointing them can fail its tamper check (`Corrupt pak index detected`) |
-| `HookHiddenModules` | `false` | Instrument the import table of a module that is in no loader list — found only by caller address, e.g. a protection helper DLL. OFF by default: such a module hides itself for a reason, and repointing its imports while it runs has ended the game at that exact instant on every launch that reached it. The module is still detected, censused and reported when this is false |
+| `HookHiddenModules` | `false` | Instrument the import table of a module that is in no loader list - found only by caller address, e.g. a protection helper DLL. OFF by default: such a module hides itself for a reason, and repointing its imports while it runs has ended the game at that exact instant on every launch that reached it. The module is still detected, censused and reported when this is false |
+| `HookDelayMs` | `0` | Wait this many ms after startup before the first IAT write. `0` = install immediately (normal - the mod loader brings the DLL in). Set it (e.g. `8000`) when the DLL is injected at instruction zero with `tools\EarlyLoad.c`: a protected module that finds its import table repointed *before* its own startup fails its tamper check and aborts the session ("something went wrong" + a support.codefusion.technology link). Everything read-only - surveys, DSE sampling, module log - still runs from t=0 |
 | `MaxHookReports` | `2000` | Cap on hook log lines so a chatty caller cannot flood the console |
 | `GpaThunks` | `true` | `GetProcAddress` calls through `HookModules`' import table are logged AND return a logging thunk (counts + last caller, reported each heartbeat). `false` if a game verifies the returned pointer |
 
@@ -291,12 +292,25 @@ Two modes, selected by `HookModules`:
 
   Several probe lines now carry the **data**, not just the call: `qip`/`qit`
   append the first 16 bytes the OS returned, `qvmm` decodes the
-  `MEMORY_BASIC_INFORMATION` it got back (`base/size/state/prot/type` — private
+  `MEMORY_BASIC_INFORMATION` it got back (`base/size/state/prot/type` - private
   versus image, committed versus free, executable or not, which is how a
   protection tells its own manual-mapped copy from a real module), `rvm` shows
   what was read out of the target process and `wvm` shows the bytes being
   written into it. That is the "what came back / what was patched" half of the
   trace; the caller is on every line.
+
+  Large cross-process writes get more than 16 bytes: the first 12 writes of
+  128 B - 256 KB each print the bytes **from the first non-zero byte onwards**
+  (three 96-byte `wvm ... blob from+0x208 part 1/3 [hex]` lines - chunked
+  because one log line has a fixed width). The zero-skip matters:
+  injected blobs usually start with hundreds of zero bytes, so a preview from
+  offset 0 would show nothing. Once the budget is spent a single
+  `previews: no more wide wvm dumps (cap 12 blobs)` line says so, and later
+  writes fall back to the 16-byte preview. When the caller cannot be named yet
+  (a hidden module that has not been attributed), the line reads
+  `(caller filtered or not resolvable - address queued)` and the bytes are
+  still shown - an observation is never dropped because attribution is
+  missing.
 
   The registry pair is how a service or a **kernel driver is registered**
   (`ImagePath`, `Type`, `Start`), so a driver install reads:
@@ -498,8 +512,13 @@ an emu do *to each other*:
   `ldr ghost: NAME @0x… size … type … protect … - in the <list> loader list, NOT
   visible to toolhelp32`, `ldr non-image: …` for loader entries pointing at
   memory that is not `MEM_IMAGE`, `ldr: <list> cycles after N distinct entries`
-  when a list has been relinked, and a one-line
-  `ldr survey: load-order N / memory-order M / init-order K …` summary.
+  when a list has been relinked - reported the first time and then only when N
+  changes, with the skipped rescans counted on the next change
+  (`... (was 88, 3 unchanged rescan(s) not repeated) ...`); a list that stops
+  cycling is reported too (`ldr: <list> no longer cycles (N distinct entries)
+  - the relink is gone`), so the dedupe can never hide a state change - and a
+  one-line `ldr survey: load-order N / memory-order M / init-order K …`
+  summary on the first pass.
   A module that `GetModuleHandle` resolves but toolhelp32 cannot see is queued
   from the hook path and verified on the worker thread (taking a toolhelp
   snapshot inside a game thread can deadlock on the loader lock), then reported
@@ -692,13 +711,22 @@ breakpoints** (non-zero `Dr0–Dr3`/`Dr7` — that would be very interesting).
     GameConsole.ini      sample settings
     tools\               test hosts and diagnostics used during development
       SingleHost.c         loads GameConsole.dll and exercises every capture path
-      StressTest.c         multithreaded file-IO / protection-change hammer
-      TestHost.c           loader-order test
+      ScanTest.c           the regression harness (what a good run must contain)
       VehProbe.c           raw lock-free-ring probe (event kinds, frames)
-      CrashProbe.c         unhandled-crash / crash-file probe
       symlookup.c/.exe     resolves image+offset to symbol via DbgHelp/PDB
       HostWatcher.c        external watcher: driver load/unload + DSE transitions,
                            for the part of the sequence that runs outside the game
                            process (start it before launching the title)
+      EarlyLoad.c/.exe     starts the game suspended, injects GameConsole.dll, then
+                           resumes - the DLL is mapped before instruction zero
+                           (Denuvo titles detect the injection; see AGENTS.md)
       RunReport.ps1        summarises/compares a run log
-      ScanTest.c           the regression harness
+      vehname.ps1          names a "[EH] veh chain" handler: section, export-table
+                           honesty, probable function start, cross-image search
+      pesect.ps1           PE section table with per-section entropy (packed or not)
+      peimpnames.ps1       import/export names of a PE (e.g. a driver's kernel
+                           touch-list)
+      StressTest.c         legacy: multithreaded file-IO hammer (loads DLLs that
+                           no longer exist - use ScanTest/SingleHost instead)
+      TestHost.c           legacy: loader-order test (same caveat)
+      CrashProbe.c         legacy: unhandled-crash probe (same caveat)
