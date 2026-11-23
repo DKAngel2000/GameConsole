@@ -1288,6 +1288,12 @@ static t_NtCreateIat pIatNtCreate_ = NULL;
 typedef LONG     (NTAPI* t_NtProtIat)(HANDLE, void**, SIZE_T*, ULONG, ULONG*);
 static t_NtProtIat pIatNtProt_ = NULL;
 static volatile LONG g_rwKb = 0;
+// Wide cross-process write previews: a protection that injects a blob writes the
+// same ~4.5 KB every time, and 16 bytes of it were all zeros in the 2026-11-23
+// run. The first few large writes get a long, non-zero-relative dump; the rest
+// stay at the 16-byte preview so a chatty injector cannot flood the log.
+static volatile LONG g_wvmWide = 0;
+#define WVM_WIDE_MAX 12
 typedef void*    (WINAPI* t_CreateServiceW)(void*, LPCWSTR, LPCWSTR, DWORD, DWORD, DWORD, DWORD, LPCWSTR, ...);
 static t_CreateServiceW pCreateSvc_ = NULL;
 typedef BOOL     (WINAPI* t_StartServiceW)(void*, DWORD, void*);
@@ -2089,6 +2095,50 @@ static int BytesPreview(const void* p, SIZE_T n, WCHAR* out, int cch, int max)
     return 1;
 }
 
+// First non-zero byte of a caller buffer, bounded and SEH-guarded: an injected
+// blob's head is zero padding (0x11D8 bytes written into ten processes on
+// 2026-11-23, the first 16 of them 00), so a preview from offset 0 says nothing.
+// Returns n when the buffer is all zero or unreadable.
+static SIZE_T FirstNonZero(const void* p, SIZE_T n)
+{
+    SIZE_T i = 0;
+    if (!p || !n) return 0;
+    __try { while (i < n && ((const BYTE*)p)[i] == 0) i++; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return i;
+}
+
+// Hex of p[from..from+max), for the chunked wide dump: EmitHook caps one line at
+// 1022 characters, so a 256-byte window is emitted as three calls.
+static int BytesPreviewAt(const void* p, SIZE_T n, SIZE_T from, WCHAR* out, int cch, int max)
+{
+    static const WCHAR hex[] = L"0123456789ABCDEF";
+    SIZE_T show;
+    int k, o = 0;
+    if (cch < 8) { if (cch > 0) out[0] = 0; return 0; }
+    out[0] = 0;
+    if (!p || from >= n) return 0;
+    show = n - from;
+    if (show > (SIZE_T)max) show = (SIZE_T)max;
+    __try
+    {
+        for (k = 0; k < (int)show && o + 4 < cch; k++)
+        {
+            BYTE b = ((const BYTE*)p)[from + (SIZE_T)k];
+            if (k) out[o++] = L' ';
+            out[o++] = hex[b >> 4];
+            out[o++] = hex[b & 0xF];
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        StringCchCopyW(out, (size_t)cch, L"unreadable");
+        return 0;
+    }
+    out[o] = 0;
+    return 1;
+}
+
 static LONG WINAPI HkIatKbNtQip(HANDLE proc, ULONG cls, void* info, ULONG len, ULONG* retLen)
 {
     LONG st = pIatNtQIP_(proc, cls, info, len, retLen);
@@ -2439,18 +2489,56 @@ static LONG WINAPI HkIatKbNtWvm(HANDLE proc, void* addr, const void* buf, SIZE_T
     LONG st = pIatNtWVM_(proc, addr, buf, len, got);
     if (!inHook && g_hooksActive && g_count < g_cap)
     {
-        WCHAR caller[300], msg[900], data[220];
+        WCHAR caller[300], msg[900], data[400];
+        LONG wide = 0;
+        int have;
         data[0] = 0;
+        inHook = 1;
+        have = DescribeCaller(caller, 300);
+        if (!have) StringCchCopyW(caller, 300, L"(caller filtered or not resolvable - address queued)");
+        inHook = 0;
+        if (buf && len && len >= 128 && len <= 0x40000) wide = InterlockedIncrement(&g_wvmWide);
+        if (wide > 0 && wide <= WVM_WIDE_MAX)
+        {
+            // A protection that injects into our process writes the same blob
+            // every time, and its head is zero padding. Show 256 bytes from the
+            // first non-zero byte, in three chunks that each fit EmitHook's
+            // 1022-character line, then say where in the blob it came from.
+            // The zero scan is capped at 64 KB so a giant write costs nothing.
+            // The dump is emitted even when the caller cannot be described: a
+            // filtered caller must not cost us the bytes (2026-11-23: 13 large
+            // writes were swallowed that way).
+            SIZE_T skip = FirstNonZero(buf, len > 0x10000 ? 0x10000 : len), c;
+            if (skip < len)
+            {
+                inHook = 1;
+                for (c = 0; c < 3; c++)
+                {
+                    if (!BytesPreviewAt(buf, len, skip + c * 96, data, 400, 96)) break;
+                    StringCchPrintfW(msg, 900,
+                        L"wvm    st=0x%08X proc=0x%llX @0x%llX len=0x%llX blob from+0x%llX part %d/3 [%s]  <- %s",
+                        (unsigned)st, (unsigned long long)(ULONG_PTR)proc,
+                        (unsigned long long)(ULONG_PTR)addr, (unsigned long long)len,
+                        (unsigned long long)skip, (int)c + 1, data, caller);
+                    EmitHook(msg);
+                }
+                inHook = 0;
+                return st;
+            }
+        }
+        else if (wide == WVM_WIDE_MAX + 1)
+        {
+            inHook = 1;
+            EmitHook(L"previews: no more wide wvm dumps (cap 12 blobs) - later writes show the first 16 bytes");
+            inHook = 0;
+        }
         if (buf && len) BytesPreview(buf, len, data, 220, 16);   // the bytes being written
         inHook = 1;
-        if (DescribeCaller(caller, 300))
-        {
-            StringCchPrintfW(msg, 900, L"wvm    st=0x%08X proc=0x%llX @0x%llX len=0x%llX%s  <- %s",
-                             (unsigned)st, (unsigned long long)(ULONG_PTR)proc,
-                             (unsigned long long)(ULONG_PTR)addr, (unsigned long long)len,
-                             data, caller);
-            EmitHook(msg);
-        }
+        StringCchPrintfW(msg, 900, L"wvm    st=0x%08X proc=0x%llX @0x%llX len=0x%llX%s  <- %s",
+                         (unsigned)st, (unsigned long long)(ULONG_PTR)proc,
+                         (unsigned long long)(ULONG_PTR)addr, (unsigned long long)len,
+                         data, caller);
+        EmitHook(msg);
         inHook = 0;
     }
     return st;
