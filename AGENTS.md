@@ -75,12 +75,26 @@ DSE poll, kernel images, service lifecycle, helper processes, teardown), and
 the in-process `wvm`/`avm` capture of dse's cross-process writes. PZ2/FFRS run
 the same artifact family — expect the same two walls; do not burn attempts.
 
+**Antivirus trap (run F, 2026-11-24 06:34 — silent 1.7 s death, no log, no
+WER).** With Defender real-time protection ON, the run dies before our worker
+starts: Defender flags `Artifact_Intel\hyperkd.sys` the moment the service
+load begins (detection logged, `ProcessName: System`), SCM event 7000
+"artifact service failed to start", the game exits before the hypervisor
+images load and before our +4.3 s worker, and dse's watchdog silently restores
+DSE a minute later. The only traces are `Get-MpThreatDetection`, the System
+event log and the watcher transcript. Defender also deletes
+`%TEMP%\dsedll\RTCore64.sys` (dse re-extracts it every run, so no lasting
+harm). **These titles need real-time protection OFF** (or exclusions for the
+game folders); with it off, run G was a textbook clean run. Unlike the HVCI
+gate (10 s, zero protection activity), this death happens *during* the
+install — the watcher's KERNEL/SERVICE lines tell the two apart.
+
 **State to leave the box in** (currently true): all three `GameConsole.ini`
 on the sanctioned recipe (`HookApis=true`, `HookExe=false`,
 `HookHiddenModules=false`, `HookDelayMs=0`); PB0's `dse.ini` has
 `logging=true` deliberately — `dse-dll.log` is now the install record; turn it
 off only if the user asks. Evidence transcripts on this box:
-`tools\HostWatcher.run{A-20261123,A2-ok-2202,B-2211,C-2216,D-2302}.log`,
+`tools\HostWatcher.run{A-20261123,A2-ok-2202,B-2211,C-2216,D-2302,F-0634,G-0637}.log`,
 `tools\EarlyLoad.runD.log`, game logs under each title's `logs\`.
 
 **Optional backlog, done 23/24 Nov (both from the 16 Nov list):**
@@ -91,9 +105,14 @@ off only if the user asks. Evidence transcripts on this box:
   unchanged rescans: the next change reads `... (was 88, 3 unchanged rescan(s)
   not repeated) ...`. A list that stops cycling is reported too (`no longer
   cycles ... - the relink is gone`) so the suppression can never hide a state
-  change. ScanTest green; **in-game proof still pending** — the build is
-  deployed, so the next ordinary PB0/PZ2 launch either shows the deduped lines
-  or the run is the proof, no special setup.
+  change. ScanTest green. **In-game (run G, 2026-11-24 06:37): the changed
+  path is proven** — 4 emissions per list over a 50 s run, every count
+  distinct (133→193→201→194), output shape correct, all integrity checks
+  green. The suppression branch itself is still unexercised on this box:
+  every rescan changed the count in both run A and run G (the counts only
+  settle late in a session; the 16 Nov box saw repeats after settling).
+  Expect the `(was N, k unchanged rescan(s) not repeated)` line the first
+  time a longer session holds a count steady.
 * **artifact's VEH handler named (item 5), as far as statics allow.** PB0's
   OS-chain handler `artifact.dll+0x1211A` (same RVA in all four 23 Nov runs):
   in `.text`, function starts at that RVA (`41 53 55 9C` = push r11/push
