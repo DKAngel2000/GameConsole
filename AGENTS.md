@@ -133,6 +133,39 @@ off only if the user asks. Evidence transcripts on this box:
 sanctioned loader path on this box. The 16 Nov next-steps below are superseded
 by the verdict above.
 
+**The hypervisor's kernel touch-list, named statically (2026-11-24,
+`tools\peimpnames.ps1` + `tools\pesect.ps1`, read-only).** The three
+`Artifact_Intel` images have intact import tables:
+* `hyperkd.sys` (11 KB, plain code): 7 imports from `hyperhv.dll`
+  (`VmFuncInitVmm`/`VmFuncUninitVmm`, `CounterThreadHandle`/`StopCounterThread`/
+  `CounterUpdater`, `NotifyRoutineActive`/`ProcessExitCleanup`) + 10 from
+  ntoskrnl (`PsCreateSystemThread`, `ExCreateCallback`/`ExRegisterCallback`/
+  `ExUnregisterCallback`, `NtQuerySystemInformation`, object refs) — a thin
+  shim that spawns a thread and registers callbacks.
+* `hyperhv.dll` (553 KB, .text entropy 6.33 — mutated, not packed; **zero VMX
+  opcodes on disk** — VMXON/VMLAUNCH/VMRESUME/VMCALL/INVEPT/INVVPID/RDMSR/WRMSR
+  all absent): 48 ntoskrnl imports are the full physical-memory kit
+  (`MmMapIoSpace`/`MmMapIoSpaceEx`, `MmGetPhysicalAddress`/`MmGetVirtualForPhysical`,
+  `MmCopyMemory`, `MmAllocateContiguousMemory`, MDL map/lock, `MmAllocateMappingAddress`,
+  `KeStackAttachProcess`, `ZwAllocateVirtualMemory`) plus the per-CPU DPC
+  broadcast set (`KeGenericCallDpc`/`KeSignalCallDpcSynchronize`/`...DpcDone`)
+  and `PsSetCreateProcessNotifyRoutine` + process-exit synchronization.
+* `hyperevade.dll` (6 KB, no imports, 6 exports imported by hyperhv) — the
+  interception layer, self-named: `TransparentHideDebugger`,
+  `TransparentUnhideDebugger`, `TransparentHandleSystemCallHook`,
+  `TransparentCheckAndModifyCpuid`, `TransparentCheckAndModifyMsrRead`,
+  `TransparentCheckAndModifyMsrWrite`. This names what was only observed
+  before: the CPUID hypervisor bit stays clear because the hypervisor filters
+  CPUID itself (hard rule 9), and the syscall/MSR/debugger interception is
+  designed to be invisible ("Transparent") — which is why kernel-level
+  activity emits nothing a user-mode logger can catch.
+* Reading of the mechanism: physical-memory/PTE-level "transparent" hooks
+  (the Mm kit + per-CPU DPCs), not on-disk VMX — either PTE-flip style or
+  runtime-decrypted VMX; proven only which APIs it *can* call. Runtime kernel
+  observation would need kernel ETW/ProcMon (events only), WinDbg (full, but
+  anti-tamper may check `KdDebuggerEnabled`), or out-of-band DMA (the only
+  view outside the CPU's translation).
+
 **Repository** `https://github.com/DKAngel2000/GameConsole` (branch `main`,
 remote `origin`). Source-only: `*.dll`, `*.exe`, `*.obj`, `logs/`, `*.log`,
 `*.csv` are gitignored, so the built DLL is *not* in the repo — run `build.cmd`.
