@@ -23,6 +23,16 @@ ldr-dedupe + `tools\vehname.ps1`; `8fe51a1` (EarlyLoad quoted-path fix);
 ScanTest green on this box at that build (exit=0, 0 ESC, 0 unattributed).
 Compare source commits across machines, never hashes across builds.
 
+**Old box note (F: drives, VS 2022 Build Tools — the machine the 16 Nov block
+below describes; titles still at the F: paths there), 24 Nov:** the legacy
+purge was rebased onto this tip as `14cb358`, the merged build `A2428D35`
+(342,016 B) built and ScanTest-green on the old box (exit=0, 0 ESC bytes,
+0 unattributed callers), and **deployed to all three F: game folders**,
+hash-verified (replacing `251103D7` in PB0/PZ2 and a drifted `ECE58078` in
+FFRS). The three folder inis were already on the sanctioned recipe
+(`HookDelayMs=0` included). One clean run per title on the old box is still
+owed before the purge counts as game-validated there.
+
 **HVCI gate (this box's 10-second silent death).** With HVCI/VBS on, PB0 exits
 ~10 s in with no protection activity, no logs and no WER. dse's readme says it
 needs HVCI/VBS off; `Win32_DeviceGuard` now reads VBS=0 / HVCI Enabled=0 and
@@ -198,10 +208,12 @@ purge (the `HookLegacyNtdll` stub patcher and the three pre-single-DLL tools
 removed): exit=0, 20 `Nt*` interposition sites, `version.dll` late-load +
 6 imports, `regkey`/`regset`, VEH chain with both handlers named,
 `ntdll#1!NtOpenFile -> ScanTest.exe+0x1000`, ntdll survey figures (51/8/43)
-identical to the 16/11 baseline, 0 ESC bytes, 0 unattributed callers. That
-commit is **harness-validated only** — the game-folder DLLs are still builds of
-`b6358c3`, so redeploy + one clean game run per title is still owed before the
-purge counts as game-validated.
+identical to the 16/11 baseline, 0 ESC bytes, 0 unattributed callers. The purge
+was rebased onto the 23/24 Nov tip as `14cb358`, the merged build ScanTest-green
+again, and **deployed to the old box's F: game folders** on 24 Nov (see the old-box
+note under the 23 Nov Repo state). One clean run per title is still owed before
+the purge counts as game-validated; the pre-purge features themselves were
+in-game validated in runs A–G at `2FB62F3A`.
 
 **Build ↔ run map for 2026-11-16** (deployed hash → repo commit → what it ran):
 `1E3C7FC0` = `9391ed4` (hidden-module guard) → **all three titles clean at 17:22/
