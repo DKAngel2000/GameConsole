@@ -30,8 +30,13 @@ purge was rebased onto this tip as `14cb358`, the merged build `A2428D35`
 0 unattributed callers), and **deployed to all three F: game folders**,
 hash-verified (replacing `251103D7` in PB0/PZ2 and a drifted `ECE58078` in
 FFRS). The three folder inis were already on the sanctioned recipe
-(`HookDelayMs=0` included). One clean run per title on the old box is still
-owed before the purge counts as game-validated there.
+(`HookDelayMs=0` included). **Game-validated on the old box 24 Nov:** all three
+titles ran to normal exits on this build (FFRS 09:47, PZ2 09:48, PB0 09:51 —
+loader-path worker starts +2764/+4409/+4664 ms), 0 ESC bytes / 0 unattributed
+callers / 0 mismatched census tallies in every log, hidden-module guard held in
+PZ2 and FFRS (dse.dll detected, verified, reported, NOT instrumented), and PZ2
+captured dse.dll's own patch-state write:
+`regset drvloader\LatestState\IsPatched = 0 <- dse.dll+0x11E5B`.
 
 **HVCI gate (this box's 10-second silent death).** With HVCI/VBS on, PB0 exits
 ~10 s in with no protection activity, no logs and no WER. dse's readme says it
@@ -211,9 +216,9 @@ removed): exit=0, 20 `Nt*` interposition sites, `version.dll` late-load +
 identical to the 16/11 baseline, 0 ESC bytes, 0 unattributed callers. The purge
 was rebased onto the 23/24 Nov tip as `14cb358`, the merged build ScanTest-green
 again, and **deployed to the old box's F: game folders** on 24 Nov (see the old-box
-note under the 23 Nov Repo state). One clean run per title is still owed before
-the purge counts as game-validated; the pre-purge features themselves were
-in-game validated in runs A–G at `2FB62F3A`.
+note under the 23 Nov Repo state). **Game-validated 24 Nov** — all three titles
+normal exits on this build; the pre-purge features themselves were in-game
+validated in runs A-G at `2FB62F3A`.
 
 **Build ↔ run map for 2026-11-16** (deployed hash → repo commit → what it ran):
 `1E3C7FC0` = `9391ed4` (hidden-module guard) → **all three titles clean at 17:22/
@@ -222,7 +227,9 @@ base redaction + watcher process tracking) → **PB0 clean at 20:22** (elevated
 launch); `9D09CCCA` = `3b04943` (hidden = toolhelp AND PEB) → the 21:11 EarlyLoad
 run that died on Denuvo's anti-tamper page; `2385E81A` = `b6358c3` (`HookDelayMs`)
 → the 22:16/22:18 runs that also failed anti-tamper but were **not** early-loaded
-(`+4374`/`+4402 ms`). Update
+(`+4374`/`+4402 ms`); `A2428D35` = `14cb358` (legacy purge, rebased) → **all
+three titles clean at 09:47/09:48/09:51 on 24 Nov** — the run that
+game-validated the purge. Update
 this line whenever you validate a change, so the next session knows what the last
 *proven* state was (`git log` is the tip; this line is about evidence, not
 recency).
