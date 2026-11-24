@@ -193,7 +193,15 @@ layer tag, at `630b2fd` with the startup reorder + 3 s DSE window, and again wit
 the hidden-module guard and the process-start diagnostic (`9391ed4`):
 exit=0, one `regkey`/`regset` each, 8 FF25 sites, VEH chain 1→2, decoded `qvmm`
 data, the DSE baseline line and `process created … worker started +N ms later`,
-0 ESC bytes, 0 unattributed callers.
+0 ESC bytes, 0 unattributed callers. Re-run green on 2026-11-24 at the legacy
+purge (the `HookLegacyNtdll` stub patcher and the three pre-single-DLL tools
+removed): exit=0, 20 `Nt*` interposition sites, `version.dll` late-load +
+6 imports, `regkey`/`regset`, VEH chain with both handlers named,
+`ntdll#1!NtOpenFile -> ScanTest.exe+0x1000`, ntdll survey figures (51/8/43)
+identical to the 16/11 baseline, 0 ESC bytes, 0 unattributed callers. That
+commit is **harness-validated only** — the game-folder DLLs are still builds of
+`b6358c3`, so redeploy + one clean game run per title is still owed before the
+purge counts as game-validated.
 
 **Build ↔ run map for 2026-11-16** (deployed hash → repo commit → what it ran):
 `1E3C7FC0` = `9391ed4` (hidden-module guard) → **all three titles clean at 17:22/
@@ -567,10 +575,12 @@ game-specific code, so the same build can be pointed at another title.
 ## Hard rules (do not violate these)
 
 1. **Never write to another module's code pages.** The only mutation is
-   rewriting *import tables* (IAT) and our own allocations. The legacy ntdll stub
-   patcher (`HookLegacyNtdll`) is off by default and would race artifact.dll's
-   own ntdll hooks into a crash; the opt-in exists only so a blanked ini can
-   never silently enable it.
+   rewriting *import tables* (IAT) and our own allocations. The legacy ntdll
+   stub patcher (`HookLegacyNtdll`) that used to live here would have raced
+   artifact.dll's own ntdll hooks into a crash; it was **removed** in the
+   2026-11-24 legacy purge instead of being kept as an off-by-default trap, so
+   no code path that writes code pages exists any more and a blanked ini can
+   never enable one.
 2. **All surveys are read-only.** `[SCAN]`, `[KRNL]`, `[SVC]`, `[EH]` walks read
    memory and enumerate OS state; they never write, allocate in another process,
    or open someone else's object. A survey that pokes at the protection is a bug.
@@ -621,11 +631,11 @@ tools\VehProbe.c                   # how the Win11 VEH node layout/encoding was 
 tools\SysInfoProbe.c               # swept NtQuerySystemInformation classes 0x00-0x120 (see quirks)
 ```
 
-`tools\CrashProbe.c`, `tools\StressTest.c` and `tools\TestHost.c` are **legacy**
-from the pre-single-DLL layout: they load `Bootstrap.dll`/`GameHooks.dll`, which
-no longer exist, so they will not exercise the current DLL. Keep them only as
-history; use `SingleHost.c`/`ScanTest.c` instead. (`SingleHost.c` needs
-`GameConsole.dll` in its own folder; the ini is created from defaults if absent.)
+`tools\CrashProbe.c`, `tools\StressTest.c` and `tools\TestHost.c` were **removed**
+(2026-11-24): pre-single-DLL relics that load `Bootstrap.dll`/`GameHooks.dll`,
+which no longer exist, so they could not exercise the current DLL. Use
+`SingleHost.c`/`ScanTest.c` instead. (`SingleHost.c` needs `GameConsole.dll` in
+its own folder; the ini is created from defaults if absent.)
 
 ### Regression harness
 
@@ -721,7 +731,7 @@ Verified 2026-11-16 at `69a499b` on Win11 Pro x64 with VS 2022 Build Tools
 * saving/log: `SaveLogFile`, `LogDirectory`, `SaveTaggedLines`, `SaveRawLines`, `WriteTraceFile`, `WriteCrashFile`, `CsvExport`
 * capture: `CaptureOutputDebugString`, `RedirectCrt`, `RedirectStdHandles`, `EnableCrashHandler`, `HoldOnCrash` (**freezes** the process on an unhandled crash; shipped ini sets false)
 * show gates: one `Show_*` per tag group; `Show_System` gates `[SYS]/[KRNL]/[SVC]`, `[EH]` rides on `Show_Exceptions`, `Show_Hooks` gates `[HOOK]`, and `[SCAN]` has no switch of its own — `CategoryOn` falls through to `Show_LogFiles` for any tag it does not recognise
-* hooks: `HookApis`, `HookFileReads`, `HookFileWrites`, `HookMemPatches`, `HookOnlyGameModules`, `HookLegacyNtdll`, `HookModules`, `HookExe` (false), `HookHiddenModules` (false), `MaxHookReports`, `GpaThunks`
+* hooks: `HookApis`, `HookFileReads`, `HookFileWrites`, `HookMemPatches`, `HookOnlyGameModules`, `HookModules`, `HookExe` (false), `HookHiddenModules` (false), `MaxHookReports`, `GpaThunks`
 * surveys: `CensusAll`, `CensusAllMax`, `ScanShadow`, `ShadowDetailMax`, `ScanLdr`, `ScanOtherHooks`, `ScanOtherHooksMax`, `ScanEh`, `ScanServices`, `ScanDrivers`, `ServiceWatch`, `ServiceWatchAll`, `WatchSharedData`, `MemGuardScan`, `MemGuardAll`
 * the remaining groups (modules, log tailing, exceptions, threads, memory, network, files, heartbeat, ODS) live in `README.md`'s settings table with their defaults — keep that table in sync with `Opts[]`
 

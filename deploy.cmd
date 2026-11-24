@@ -1,13 +1,12 @@
 @echo off
 rem Copies the built single-DLL GameConsole into the game folder.
 rem
-rem There is only ONE file to deploy now: GameConsole.dll (built by build.cmd,
+rem There is only ONE file to deploy: GameConsole.dll (built by build.cmd,
 rem ~250 KB, plain C). The game's artifact.json must name it in load_dlls:
 rem
 rem     "load_dlls": ["gameconsole.dll", "dse.dll"]
 rem
-rem This DLL self-starts from DllMain (a game loader only calls LoadLibraryW),
-rem so no Bootstrap.dll or GameHooks.dll is needed any more.
+rem This DLL self-starts from DllMain (a game loader only calls LoadLibraryW).
 setlocal
 set "GAME=H:\Games\FINAL FANTASY RESONANCE\FFRS\Binaries\Win64"
 set "SRC=%~dp0"
@@ -41,12 +40,6 @@ if errorlevel 1 (
   echo Copy failed. Is the game running / is the folder writable?
   exit /b 1
 )
-
-rem retire the old multi-DLL layout if it is still present
-if exist "%GAME%\Bootstrap.dll" del /q "%GAME%\Bootstrap.dll"
-if exist "%GAME%\GameHooks.dll" del /q "%GAME%\GameHooks.dll"
-if exist "%GAME%\hooks.log"     del /q "%GAME%\hooks.log"
-if exist "%LOCALAPPDATA%\GameConsole\GameHooks.dll" del /q "%LOCALAPPDATA%\GameConsole\GameHooks.dll"
 
 for %%F in ("%GAME%\GameConsole.dll") do set "SIZE=%%~zF"
 echo Deployed to %GAME%

@@ -11,7 +11,6 @@
 //   - the IAT hook layer (HookIatName/HookIatByValue/HookIatApi + every HkIat*
 //     handler + the KERNELBASE interposition layer + the toolhelp walk for the
 //     KERNELBASE/ntdll copies + FindWorkingNtdll)
-//   - the legacy ntdll stub patching (PatchEx/AllocTramp/SuspendAll/ResumeAll)
 //
 // Everything that used to go to hooks.log now travels through the ring as a
 // fully formatted wide "hook line" (event kind 6) and is printed by the worker.
@@ -127,7 +126,7 @@ static int MonMemory, MemBaseline;
 static int MonNetwork, NetNew, NetChanges, NetClosed;
 static int MonFiles, MonTempDir, FsCreated, FsDeleted, FsRenamed;
 static int MonHeartbeat;
-static int HookApis, HookFileReads, HookFileWrites, HookMemPatches, HookOnlyGameModules, HookLegacyNtdll;
+static int HookApis, HookFileReads, HookFileWrites, HookMemPatches, HookOnlyGameModules;
 static int ShowHooks;
 static int ConsoleCols = 300, ConsoleRows = 20000, MaxCrashReports = 25, MaxOtherExceptions = 500,
            LogScanDepth = 3, HeartbeatSeconds = 10, MaxHookReports = 2000;
@@ -244,13 +243,12 @@ static const Opt Opts[] = {
     { "#", "", "Heartbeat" },
     { "MonHeartbeat", "true", "Print thread/handle/memory counts periodically" },
     { "HeartbeatSeconds", "10", "Seconds between heartbeats (1-3600)" },
-    { "#", "", "Hooks (opt-in: patches ntdll Nt* exports in-process to log them)" },
-    { "HookApis", "true", "Install lightweight ntdll hooks. Set false for the old purely passive design" },
+    { "#", "", "Hooks (opt-in: instrument import tables + the KERNELBASE interposition layer to log calls - no code bytes are ever patched)" },
+    { "HookApis", "true", "Install the hook layer. Set false for a purely passive, survey-only session" },
     { "HookFileReads", "true", "Log NtReadFile calls (file reads)" },
     { "HookFileWrites", "true", "Log NtCreateFile / NtOpenFile / NtWriteFile calls" },
     { "HookMemPatches", "true", "Log NtProtectVirtualMemory calls when execute rights are involved (code patching)" },
     { "HookOnlyGameModules", "true", "true = skip callers inside the Windows folder (game/mod DLLs only)" },
-    { "HookLegacyNtdll", "false", "Also allow the legacy ntdll stub patching when HookModules is empty. Dangerous: races other mods' ntdll hooks" },
     { "HookModules", "", "Comma-separated module names whose IAT is instrumented, e.g. artifact.dll. Empty = no per-module IAT hooks, but the KERNELBASE interposition layer is still installed and logs ALL callers" },
     { "HookExe", "false", "Also instrument the game executable's own import table. OFF by default: a Denuvo-protected exe checks its own imports, and repointing them can make it fail its own tamper check (seen as 'corrupt pak index' in UE titles). Turn on only when you need the exe's own first-hop calls" },
     { "HookHiddenModules", "false", "Instrument the import table of a module that is in no loader list (found only by caller address, e.g. a protection helper). OFF by default: such a module is deliberately hidden from the loader, and repointing its imports while it runs has killed the game at that exact moment three times out of three. It is still detected, censused and reported when this is false" },
@@ -478,7 +476,6 @@ static void LoadSettings(void)
     if (HeartbeatSeconds < 1) HeartbeatSeconds = 1; if (HeartbeatSeconds > 3600) HeartbeatSeconds = 3600;
     HookApis = B("HookApis"); HookFileReads = B("HookFileReads"); HookFileWrites = B("HookFileWrites");
     HookMemPatches = B("HookMemPatches"); HookOnlyGameModules = B("HookOnlyGameModules");
-    HookLegacyNtdll = B("HookLegacyNtdll");
     MaxHookReports = I("MaxHookReports"); TrimToW(V("HookModules"), g_hookModules, 600);
     ScanOtherHooks = B("ScanOtherHooks"); ScanOtherHooksMax = I("ScanOtherHooksMax");
     ShadowDetailMax = I("ShadowDetailMax");
@@ -687,7 +684,7 @@ static int IsPlumbingName(const WCHAR* name)
     static const WCHAR* skip[] = {
         L"ntdll.dll", L"KERNELBASE.dll", L"kernel32.dll", L"win32u.dll", L"ucrtbase.dll",
         L"VCRUNTIME140.dll", L"VCRUNTIME140_1.dll", L"MSVCP140.dll", L"combase.dll",
-        L"rpcrt4.dll", L"mscoree.dll", L"GameConsole.dll", L"GameHooks.dll", NULL };
+        L"rpcrt4.dll", L"mscoree.dll", L"GameConsole.dll", NULL };
     int i;
     for (i = 0; skip[i]; i++) if (_wcsicmp(name, skip[i]) == 0) return 1;
     return 0;
@@ -935,30 +932,15 @@ typedef struct { USHORT Len, Max; WCHAR* Buf; } UNI2;
 typedef struct { ULONG Len, Pad; HANDLE Root; UNI2* Name; ULONG Attr; } OA;
 typedef struct { NTSTATUS Status; ULONG_PTR Information; } IOSB;
 
-typedef NTSTATUS (NTAPI* t_NtOpenFile)  (PHANDLE, ACCESS_MASK, OA*, IOSB*, ULONG, ULONG);
-typedef NTSTATUS (NTAPI* t_NtCreateFile)(PHANDLE, ACCESS_MASK, OA*, IOSB*, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
-typedef NTSTATUS (NTAPI* t_NtRw)        (HANDLE, HANDLE, void*, void*, IOSB*, void*, ULONG, PLARGE_INTEGER, PULONG);
-typedef NTSTATUS (NTAPI* t_NtProtect)   (HANDLE, void**, SIZE_T*, ULONG, PULONG);
 typedef LONG     (NTAPI* t_NtQueryInfoFile)(HANDLE, IOSB*, void*, ULONG, int);
-
-static void* tOpen = NULL;
-static void* tCreate = NULL;
-static void* tRead = NULL;
-static void* tWrite = NULL;
-static void* tProtect = NULL;
 
 static t_NtQueryInfoFile pQIF = NULL;
 
 static volatile LONG g_count = 0;
 static LONG g_cap = 2000;
 static int g_reads = 1, g_writes = 1, g_prot = 1, g_onlyGame = 1;
-static WCHAR g_filter[600] = L"";
 static WCHAR g_win[300] = L"";
 static int g_hooksActive = 0;
-static BYTE* trampNext = NULL;
-static BYTE* trampEnd  = NULL;
-
-static HANDLE g_susp[1024]; static DWORD g_suspTid[1024]; static int g_nsusp = 0;
 
 // Push a fully formatted hook line into the ring. Called from hook handlers on
 // arbitrary game threads: no file I/O, no allocation, no runtime entry.
@@ -982,7 +964,7 @@ static int IsSkipName(const WCHAR* n)
     static const WCHAR* skip[] = {
         L"ntdll.dll", L"kernelbase.dll", L"kernel32.dll", L"win32u.dll", L"ucrtbase.dll",
         L"vcruntime140.dll", L"vcruntime140_1.dll", L"msvcp140.dll", L"combase.dll",
-        L"rpcrt4.dll", L"mscoree.dll", L"apphelp.dll", L"gameconsole.dll", L"gamehooks.dll", NULL };
+        L"rpcrt4.dll", L"mscoree.dll", L"apphelp.dll", L"gameconsole.dll", NULL };
     int i;
     for (i = 0; skip[i]; i++) if (_wcsicmp(n, skip[i]) == 0) return 1;
     return 0;
@@ -1112,21 +1094,6 @@ static int DescribeCaller(WCHAR* out, int cch)
         if (!name || !name[0]) continue;
         if (IsSkipName(name)) continue;
         if (g_onlyGame && sys) continue;
-        if (g_filter[0])
-        {
-            int ok = 0; const WCHAR* p = g_filter;
-            while (*p)
-            {
-                const WCHAR* e2; int cl;
-                while (*p == L' ') p++;
-                e2 = wcschr(p, L',');
-                cl = e2 ? (int)(e2 - p) : (int)wcslen(p);
-                while (cl > 0 && p[cl - 1] == L' ') cl--;
-                if (cl > 0 && _wcsnicmp(name, p, cl) == 0 && name[cl] == 0) { ok = 1; break; }
-                p = e2 ? e2 + 1 : p + wcslen(p);
-            }
-            if (!ok) continue;
-        }
         StringCchPrintfW(out, cch, L"%s+0x%llX", name,
                          (unsigned long long)((ULONG_PTR)frames[i] - base));
         return 1;
@@ -1152,110 +1119,6 @@ static void HandleName(HANDLE h, WCHAR* out, int cch)
     if (chars > (ULONG)(cch - 1)) chars = (ULONG)(cch - 1);
     memcpy(out, raw + 4, chars * 2);
     out[chars] = 0;
-}
-
-static NTSTATUS NTAPI HkOpenFile(PHANDLE fh, ACCESS_MASK acc, OA* oa, IOSB* iosb, ULONG share, ULONG opts)
-{
-    NTSTATUS st = ((t_NtOpenFile)tOpen)(fh, acc, oa, iosb, share, opts);
-    if (!inHook && g_writes && g_hooksActive && g_count < g_cap)
-    {
-        WCHAR caller[300], msg[1800], path[760];
-        inHook = 1;
-        if (DescribeCaller(caller, 300))
-        {
-            if (oa && oa->Name && oa->Name->Buf && oa->Name->Len)
-                StringCchPrintfW(path, 760, L"%.*s", (int)(oa->Name->Len / 2), oa->Name->Buf);
-            else { path[0] = L'?'; path[1] = 0; }
-            StringCchPrintfW(msg, 1800, L"open   st=0x%08X acc=0x%08X \"%s\"  <- %s",
-                             (unsigned)st, (unsigned)acc, NtPath(path), caller);
-            EmitHook(msg);
-        }
-        inHook = 0;
-    }
-    return st;
-}
-
-static NTSTATUS NTAPI HkCreateFile(PHANDLE fh, ACCESS_MASK acc, OA* oa, IOSB* iosb, LARGE_INTEGER* alloc,
-                                   ULONG attr, ULONG share, ULONG disp, ULONG opts, void* ea, ULONG eaLen)
-{
-    NTSTATUS st = ((t_NtCreateFile)tCreate)(fh, acc, oa, iosb, alloc, attr, share, disp, opts, ea, eaLen);
-    if (!inHook && g_writes && g_hooksActive && g_count < g_cap)
-    {
-        WCHAR caller[300], msg[1800], path[760];
-        inHook = 1;
-        if (DescribeCaller(caller, 300))
-        {
-            if (oa && oa->Name && oa->Name->Buf && oa->Name->Len)
-                StringCchPrintfW(path, 760, L"%.*s", (int)(oa->Name->Len / 2), oa->Name->Buf);
-            else { path[0] = L'?'; path[1] = 0; }
-            StringCchPrintfW(msg, 1800, L"create st=0x%08X acc=0x%08X \"%s\"  <- %s",
-                             (unsigned)st, (unsigned)acc, NtPath(path), caller);
-            EmitHook(msg);
-        }
-        inHook = 0;
-    }
-    return st;
-}
-
-static NTSTATUS NTAPI HkReadFile(HANDLE h, HANDLE ev, void* apc, void* apcCtx, IOSB* iosb,
-                                 void* buf, ULONG len, LARGE_INTEGER* off, ULONG* key)
-{
-    NTSTATUS st = ((t_NtRw)tRead)(h, ev, apc, apcCtx, iosb, buf, len, off, key);
-    if (!inHook && g_reads && g_hooksActive && g_count < g_cap)
-    {
-        WCHAR caller[300], msg[1500], path[400];
-        inHook = 1;
-        if (DescribeCaller(caller, 300))
-        {
-            unsigned long long got;
-            HandleName(h, path, 400);
-            got = (st >= 0 && iosb) ? (unsigned long long)iosb->Information : 0;
-            StringCchPrintfW(msg, 1500, L"read   st=0x%08X got=%llu \"%s\"  <- %s", (unsigned)st, got, path, caller);
-            EmitHook(msg);
-        }
-        inHook = 0;
-    }
-    return st;
-}
-
-static NTSTATUS NTAPI HkWriteFile(HANDLE h, HANDLE ev, void* apc, void* apcCtx, IOSB* iosb,
-                                  void* buf, ULONG len, LARGE_INTEGER* off, ULONG* key)
-{
-    NTSTATUS st = ((t_NtRw)tWrite)(h, ev, apc, apcCtx, iosb, buf, len, off, key);
-    if (!inHook && g_writes && g_hooksActive && g_count < g_cap)
-    {
-        WCHAR caller[300], msg[1500], path[400];
-        inHook = 1;
-        if (DescribeCaller(caller, 300))
-        {
-            unsigned long long got;
-            HandleName(h, path, 400);
-            got = (st >= 0 && iosb) ? (unsigned long long)iosb->Information : 0;
-            StringCchPrintfW(msg, 1500, L"write  st=0x%08X got=%llu \"%s\"  <- %s", (unsigned)st, got, path, caller);
-            EmitHook(msg);
-        }
-        inHook = 0;
-    }
-    return st;
-}
-
-static NTSTATUS NTAPI HkProtect(HANDLE proc, void** base, SIZE_T* size, ULONG newp, ULONG* oldp)
-{
-    NTSTATUS st = ((t_NtProtect)tProtect)(proc, base, size, newp, oldp);
-    if (!inHook && g_prot && g_hooksActive && g_count < g_cap && base && size && oldp && ((newp | *oldp) & 0xF0) != 0)
-    {
-        WCHAR caller[300], msg[600];
-        inHook = 1;
-        if (DescribeCaller(caller, 300))
-        {
-            StringCchPrintfW(msg, 600, L"prot   st=0x%08X @0x%llX+0x%llX old=0x%X new=0x%X  <- %s",
-                             (unsigned)st, (unsigned long long)(ULONG_PTR)*base,
-                             (unsigned long long)*size, (unsigned)*oldp, (unsigned)newp, caller);
-            EmitHook(msg);
-        }
-        inHook = 0;
-    }
-    return st;
 }
 
 // ---------------------------------------------------------------- IAT hooks
@@ -3640,6 +3503,7 @@ static void InstallIatHooks(int reads, int writes, int prot, int cap, const WCHA
     const WCHAR* p;
     if (g_hooksActive) return;
     g_reads = reads; g_writes = writes; g_prot = prot;
+    g_onlyGame = HookOnlyGameModules;      // caller-naming filter, used by DescribeCaller
     g_cap = cap > 0 ? cap : 2000;
     g_pid = GetCurrentProcessId();
     GetWindowsDirectoryW(g_win, 300);
@@ -4105,147 +3969,6 @@ static void InstallKernelbaseInterposition(void)
     {
         WCHAR msg[300];
         StringCchPrintfW(msg, 300, L"(iat) %d imports hooked via import tables (no code bytes modified)", hooked);
-        HookNote(msg);
-    }
-}
-
-// ---------------------------------------------------------------- legacy ntdll patching
-static BYTE* AllocTramp(void)
-{
-    if (!trampNext || trampNext + 64 > trampEnd)
-    {
-        BYTE* page = (BYTE*)VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-        if (!page) return NULL;
-        trampNext = page; trampEnd = page + 4096;
-    }
-    {
-        BYTE* p = trampNext; trampNext += 64; return p;
-    }
-}
-
-static void HookSkip(const char* name, const char* why)
-{
-    WCHAR wname[64], wwhy[200], msg[300];
-    MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, 64);
-    MultiByteToWideChar(CP_UTF8, 0, why, -1, wwhy, 200);
-    StringCchPrintfW(msg, 300, L"(skip) %s: %s", wname, wwhy);
-    HookNote(msg);
-}
-
-static int PatchEx(const char* name, BYTE* target, void* hook, void** slot)
-{
-    DWORD oldp = 0, oldp2 = 0;
-    if (!target) { HookSkip(name, "export not found"); return 0; }
-    if (!*slot)
-    {
-        BYTE b8;
-        BYTE* t;
-        if (!(target[0] == 0x4C && target[1] == 0x8B && target[2] == 0xD1 && target[3] == 0xB8))
-        { HookSkip(name, "unexpected prologue (shimmed or already hooked)"); return 0; }
-        b8 = target[8];
-        if (!(b8 == 0x0F || b8 == 0xF6 || b8 == 0xC3 || b8 == 0xE9 || b8 == 0xEB))
-        { HookSkip(name, "unexpected stub body"); return 0; }
-        t = AllocTramp();
-        if (!t) { HookSkip(name, "no trampoline memory"); return 0; }
-        memcpy(t, target, 16);
-        t[16] = 0xFF; t[17] = 0x25; *(DWORD*)(t + 18) = 0;
-        *(ULONG_PTR*)(t + 22) = (ULONG_PTR)(target + 16);
-        *slot = t;
-    }
-    if (!VirtualProtect(target, 16, PAGE_EXECUTE_READWRITE, &oldp))
-    { HookSkip(name, "VirtualProtect failed"); return 0; }
-    target[14] = 0x90; target[15] = 0x90;
-    target[0] = 0xFF; target[1] = 0x25; *(DWORD*)(target + 2) = 0;
-    *(ULONG_PTR*)(target + 6) = (ULONG_PTR)hook;
-    FlushInstructionCache(GetCurrentProcess(), target, 16);
-    VirtualProtect(target, 16, oldp, &oldp2);
-    return 1;
-}
-
-static void SuspendAll(void)
-{
-    int pass;
-    for (pass = 0; pass < 3; pass++)
-    {
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        THREADENTRY32 te; DWORD self = GetCurrentThreadId();
-        if (snap == INVALID_HANDLE_VALUE) break;
-        te.dwSize = sizeof(te);
-        if (Thread32First(snap, &te))
-        {
-            do
-            {
-                int known = 0, i;
-                HANDLE h;
-                if (te.th32OwnerProcessID != g_pid || te.th32ThreadID == self) continue;
-                for (i = 0; i < g_nsusp; i++) if (g_suspTid[i] == te.th32ThreadID) { known = 1; break; }
-                if (known) continue;
-                h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
-                if (h && SuspendThread(h) != (DWORD)-1 && g_nsusp < 1024)
-                { g_susp[g_nsusp] = h; g_suspTid[g_nsusp] = te.th32ThreadID; g_nsusp++; }
-                else if (h) CloseHandle(h);
-            } while (Thread32Next(snap, &te));
-        }
-        CloseHandle(snap);
-    }
-}
-
-static void ResumeAll(void)
-{
-    int i;
-    for (i = 0; i < g_nsusp; i++) { ResumeThread(g_susp[i]); CloseHandle(g_susp[i]); }
-    g_nsusp = 0;
-}
-
-static void InstallLegacyHooks(int reads, int writes, int prot, int onlyGame, int cap, const WCHAR* filter)
-{
-    HMODULE nts[8]; int nnt = 0, i, ok = 0;
-    HANDLE snap;
-    if (g_hooksActive) return;
-    g_reads = reads; g_writes = writes; g_prot = prot; g_onlyGame = onlyGame;
-    g_cap = cap > 0 ? cap : 2000;
-    g_pid = GetCurrentProcessId();
-    GetWindowsDirectoryW(g_win, 300);
-    if (filter && *filter) StringCchCopyW(g_filter, 600, filter);
-    g_hooksActive = 1;
-    if (!pStack) pStack = (t_CaptureStack)(void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "RtlCaptureStackBackTrace");
-    if (!pQIF) pQIF = (t_NtQueryInfoFile)(void*)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationFile");
-
-    snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, g_pid);
-    if (snap != INVALID_HANDLE_VALUE)
-    {
-        MODULEENTRY32W me; me.dwSize = sizeof(me);
-        if (Module32FirstW(snap, &me))
-        {
-            do
-            {
-                if (_wcsicmp(me.szModule, L"ntdll.dll") == 0 && nnt < 8)
-                {
-                    int dup = 0;
-                    for (i = 0; i < nnt; i++) if (nts[i] == me.hModule) dup = 1;
-                    if (!dup) nts[nnt++] = me.hModule;
-                }
-            } while (Module32NextW(snap, &me));
-        }
-        CloseHandle(snap);
-    }
-    if (!nnt) nts[nnt++] = GetModuleHandleW(L"ntdll.dll");
-
-    SuspendAll();
-    for (i = 0; i < nnt; i++)
-    {
-        HMODULE nt = nts[i];
-        if (g_writes) ok += PatchEx("NtOpenFile", (BYTE*)GetProcAddress(nt, "NtOpenFile"), HkOpenFile, &tOpen);
-        if (g_writes) ok += PatchEx("NtCreateFile", (BYTE*)GetProcAddress(nt, "NtCreateFile"), HkCreateFile, &tCreate);
-        if (g_reads)  ok += PatchEx("NtReadFile", (BYTE*)GetProcAddress(nt, "NtReadFile"), HkReadFile, &tRead);
-        if (g_writes) ok += PatchEx("NtWriteFile", (BYTE*)GetProcAddress(nt, "NtWriteFile"), HkWriteFile, &tWrite);
-        if (g_prot)   ok += PatchEx("NtProtectVirtualMemory", (BYTE*)GetProcAddress(nt, "NtProtectVirtualMemory"), HkProtect, &tProtect);
-    }
-    ResumeAll();
-
-    {
-        WCHAR msg[300];
-        StringCchPrintfW(msg, 300, L"hooks installed: %d exports patched across %d ntdll image(s)", ok, nnt);
         HookNote(msg);
     }
 }
@@ -5369,25 +5092,11 @@ static void InstallHooks(void)
             HookFileReads, HookFileWrites, HookMemPatches);
         Write(L"[INFO]", msg);
     }
-    else if (!HookLegacyNtdll)
+    else
     {
         InstallIatHooks(HookFileReads ? 1 : 0, HookFileWrites ? 1 : 0, HookMemPatches ? 1 : 0,
                         MaxHookReports, mods);
         Write(L"[INFO]", L"hooks: no module list to instrument - KERNELBASE interposition layer installed for ALL callers (reads/writes/prot apply); set HookModules=<dll> or HookExe=true to also instrument an import table");
-    }
-    else
-    {
-        WCHAR msg[1100];
-        InstallIatHooks(HookFileReads ? 1 : 0, HookFileWrites ? 1 : 0, HookMemPatches ? 1 : 0,
-                        MaxHookReports, mods);
-        InstallLegacyHooks(HookFileReads ? 1 : 0, HookFileWrites ? 1 : 0, HookMemPatches ? 1 : 0,
-                           HookOnlyGameModules ? 1 : 0, MaxHookReports, mods);
-        StringCchPrintfW(msg, 1100,
-            L"hooks: KERNELBASE interposition + legacy ntdll stub patching installed%s (reads=%d writes=%d prot=%d%s) - activity appears as [HOOK] lines",
-            mods[0] ? L" on the module list" : L"",
-            HookFileReads, HookFileWrites, HookMemPatches,
-            HookOnlyGameModules ? L", game modules only" : L"");
-        Write(L"[INFO]", msg);
     }
 }
 

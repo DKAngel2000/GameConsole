@@ -20,7 +20,7 @@ Produces `GameConsole.dll` (~250 KB, x64).
 ## Deploy
 
 Run `deploy.cmd` (edit its `GAME=` line if your game folder differs). It copies
-`GameConsole.dll` into the game folder and retires the old multi-DLL layout.
+`GameConsole.dll` into the game folder.
 
 The game's loader must load it. For a loader that reads a JSON list of DLLs and only
 calls `LoadLibraryW`:
@@ -151,16 +151,15 @@ repo overrides four of them: `HoldOnCrash=false`, `HookModules=artifact.dll,dse.
 | `MonHeartbeat` | `true` | Print thread/handle/memory counts periodically |
 | `HeartbeatSeconds` | `10` | Seconds between heartbeats (1-3600); the heartbeat drives the periodic rescans and monitors |
 
-### Hooks (opt-in: patches ntdll `Nt*` exports in-process to log them)
+### Hooks (opt-in: instrument import tables + the KERNELBASE interposition layer to log them — no code bytes are ever patched)
 
 | switch | default | meaning |
 |---|---|---|
-| `HookApis` | `true` | Install lightweight ntdll hooks; `false` = the old purely passive design |
+| `HookApis` | `true` | Install the hook layer; `false` = a purely passive, survey-only session |
 | `HookFileReads` | `true` | Log `NtReadFile` calls (file reads) |
 | `HookFileWrites` | `true` | Log `NtCreateFile`/`NtOpenFile`/`NtWriteFile` calls |
 | `HookMemPatches` | `true` | Log `NtProtectVirtualMemory` calls when execute rights are involved (code patching) |
 | `HookOnlyGameModules` | `true` | `true` = skip callers inside the Windows folder (game/mod DLLs only) |
-| `HookLegacyNtdll` | `false` | Also allow legacy ntdll stub patching when `HookModules` is empty. **Dangerous**: races other mods' ntdll hooks |
 | `HookModules` | *(empty)* | Comma-separated module names whose IAT is instrumented, e.g. `artifact.dll`. Empty = no per-module IAT hooks, but the KERNELBASE interposition layer is still installed and logs all callers |
 | `HookExe` | `false` | Also instrument the game executable's own import table. OFF by default: a protected exe checks its own imports, and repointing them can fail its tamper check (`Corrupt pak index detected`) |
 | `HookHiddenModules` | `false` | Instrument the import table of a module that is in no loader list - found only by caller address, e.g. a protection helper DLL. OFF by default: such a module hides itself for a reason, and repointing its imports while it runs has ended the game at that exact instant on every launch that reached it. The module is still detected, censused and reported when this is false |
@@ -361,15 +360,10 @@ Two modes, selected by `HookModules`:
   did this). The KERNELBASE interposition layer already covers calls that go
   through KERNELBASE without touching the protected image.
 
-- **`HookModules` empty** — no per-module IAT hooks, but the **KERNELBASE
+- **`HookModules` empty** - no per-module IAT hooks, but the **KERNELBASE
   interposition layer is still installed**, so calls from *any* module through
   KERNELBASE's imported `Nt*` functions are logged. This is the right setting for
-  a game whose mod you do not know yet. If `HookLegacyNtdll=true` as well, the
-  legacy mode is also enabled: patching the ntdll syscall stubs directly across
-  every ntdll copy in the process. **Do not use the legacy mode in a game whose
-  other mods hook those stubs** (artifact.dll does) — the two patchers race and
-  the process dies in under a second. The opt-in exists so a blanked or reverted
-  ini can never silently produce that.
+  a game whose mod you do not know yet.
 
 Hook activity and the per-API install lines appear as `[HOOK]` lines (dark magenta,
 gated by `Show_Hooks`), capped by `MaxHookReports`. There is no separate hook log file;
